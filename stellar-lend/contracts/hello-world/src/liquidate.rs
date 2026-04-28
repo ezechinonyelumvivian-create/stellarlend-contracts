@@ -428,19 +428,6 @@ fn emit_liquidation_events(
     .ok();
 }
 
-    // Formal-verification postcondition note:
-    // liquidation cannot increase borrower debt/collateral and must respect caps.
-    /* debug_assert!(fv_liquidate_postconditions(
-        &fv_snapshot,
-        &liquidator_position_before,
-        &borrower_position,
-        &liquidator_position,
-        repay_amount,
-    )); */
-
-    Ok((actual_debt_liquidated, collateral_seized, incentive_amount))
-}
-
 /// Update protocol analytics after liquidation
 fn record_liquidation_analytics(
     env: &Env,
