@@ -12,7 +12,7 @@ pub mod test_helpers;
 pub mod withdraw_test;
 // Disabled — pre-existing failures unrelated to this issue
 // pub mod amm_impact_test;
-// pub mod analytics_test;
+pub mod analytics_test;
 // pub mod admin_test;
 // pub mod asset_config_test;
 // pub mod borrow_cap_test;
