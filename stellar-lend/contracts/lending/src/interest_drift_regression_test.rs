@@ -196,6 +196,6 @@ mod interest_drift_regression_tests {
         }
 
         // 100,000 * 1.0 = 100,000 exact
-        assert!(total >= 95_000 && total <= 105_000, "total: {}", total);
+        assert!((95_000..=105_000).contains(&total), "total: {}", total);
     }
 }

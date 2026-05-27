@@ -433,7 +433,7 @@ mod test {
 
     #[test]
     fn test_set_min_borrow_admin_only() {
-        let (_env, client, admin, _user) = setup();
+        let (_env, client, _admin, _user) = setup();
         assert_eq!(client.get_min_borrow(), 0);
         client.set_min_borrow(&100);
         assert_eq!(client.get_min_borrow(), 100);
