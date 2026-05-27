@@ -2,6 +2,15 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
+#[cfg(test)]
+mod property_invariants_test;
+
+fn require_positive_amount(amount: i128) {
+    if amount <= 0 {
+        panic!("amount must be positive");
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PositionSummary {
@@ -26,40 +35,50 @@ impl LendingContract {
 
     /// Deposit collateral for a user.
     pub fn deposit(env: Env, user: Address, amount: i128) -> i128 {
+        require_positive_amount(amount);
         user.require_auth();
         let key = ("col", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current + amount;
+        let new_balance = current.checked_add(amount).expect("collateral overflow");
         env.storage().persistent().set(&key, &new_balance);
         new_balance
     }
 
     /// Withdraw collateral for a user.
     pub fn withdraw(env: Env, user: Address, amount: i128) -> i128 {
+        require_positive_amount(amount);
         user.require_auth();
         let key = ("col", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current - amount;
+        if amount > current {
+            panic!("insufficient collateral");
+        }
+        let new_balance = current.checked_sub(amount).expect("collateral underflow");
         env.storage().persistent().set(&key, &new_balance);
         new_balance
     }
 
     /// Borrow against deposited collateral.
     pub fn borrow(env: Env, user: Address, amount: i128) -> i128 {
+        require_positive_amount(amount);
         user.require_auth();
         let key = ("debt", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_debt = current + amount;
+        let new_debt = current.checked_add(amount).expect("debt overflow");
         env.storage().persistent().set(&key, &new_debt);
         new_debt
     }
 
     /// Repay debt.
     pub fn repay(env: Env, user: Address, amount: i128) -> i128 {
+        require_positive_amount(amount);
         user.require_auth();
         let key = ("debt", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_debt = current - amount;
+        if amount > current {
+            panic!("insufficient debt");
+        }
+        let new_debt = current.checked_sub(amount).expect("debt underflow");
         env.storage().persistent().set(&key, &new_debt);
         new_debt
     }
