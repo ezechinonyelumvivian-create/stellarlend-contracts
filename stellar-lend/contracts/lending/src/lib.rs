@@ -26,12 +26,10 @@ pub struct LendingContract;
 
 #[contractimpl]
 impl LendingContract {
-    /// Initialize the lending contract with an admin.
     pub fn initialize(env: Env, admin: Address) {
         env.storage().instance().set(&"admin", &admin);
     }
 
-    /// Get the configured admin (or panic if uninitialized).
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&"admin").unwrap()
     }
@@ -66,7 +64,6 @@ impl LendingContract {
         new_balance
     }
 
-    /// Withdraw collateral for a user.
     pub fn withdraw(env: Env, user: Address, amount: i128) -> i128 {
         // Prevent mutating during an active flash loan callback
         let active: bool = env.storage().instance().get(&"flash_active").unwrap_or(false);
@@ -95,7 +92,6 @@ impl LendingContract {
         Ok(new_debt)
     }
 
-    /// Repay debt.
     pub fn repay(env: Env, user: Address, amount: i128) -> i128 {
         // Prevent mutating during an active flash loan callback
         let active: bool = env.storage().instance().get(&"flash_active").unwrap_or(false);
@@ -103,11 +99,16 @@ impl LendingContract {
             panic!("FlashLoanReentrancy");
         }
         user.require_auth();
-        let key = ("debt", user.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_debt = current - amount;
-        env.storage().persistent().set(&key, &new_debt);
-        new_debt
+        let now = env.ledger().timestamp();
+        let position = load_debt(&env, &user);
+        let updated = repay_amount(position, now, amount, DEFAULT_APR_BPS)
+            .unwrap_or_else(|_| panic_with_debt_error());
+        save_debt(&env, &user, &updated);
+        updated.principal
+    }
+
+    pub fn get_debt_position(env: Env, user: Address) -> DebtPosition {
+        load_debt(&env, &user)
     }
 
     // Flash loan fee setter (bps). Only admin may call.
@@ -202,11 +203,9 @@ impl LendingContract {
             .persistent()
             .get(&("col", user.clone()))
             .unwrap_or(0);
-        let debt: i128 = env
-            .storage()
-            .persistent()
-            .get(&("debt", user.clone()))
-            .unwrap_or(0);
+        let position = load_debt(&env, &user);
+        let debt = effective_debt(&position, env.ledger().timestamp(), DEFAULT_APR_BPS)
+            .unwrap_or(position.principal);
         PositionSummary {
             collateral: col,
             debt,
@@ -214,10 +213,14 @@ impl LendingContract {
     }
 }
 
+fn panic_with_debt_error() -> ! {
+    panic!("debt operation failed");
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
 
     fn setup() -> (Env, LendingContractClient<'static>, Address, Address) {
         let env = Env::default();
@@ -228,6 +231,13 @@ mod test {
         let user = Address::generate(&env);
         client.initialize(&admin);
         (env, client, admin, user)
+    }
+
+    fn advance_time(env: &Env, seconds: u64) {
+        let mut li = env.ledger().get();
+        li.timestamp = li.timestamp.saturating_add(seconds);
+        li.sequence_number = li.sequence_number.saturating_add(1);
+        env.ledger().set(li);
     }
 
     #[test]
@@ -310,3 +320,6 @@ mod test {
         assert_eq!(client.get_min_borrow(), 100);
     }
 }
+
+#[cfg(test)]
+mod interest_drift_regression_test;
