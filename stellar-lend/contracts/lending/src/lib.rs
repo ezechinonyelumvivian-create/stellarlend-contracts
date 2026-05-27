@@ -123,7 +123,7 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
 
-    fn setup() -> (Env, LendingContractClient<'static>, Address, Address) {
+    fn setup() -> (Env, LendingContractClient<'static>, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
         let id = env.register(LendingContract, ());
@@ -131,28 +131,29 @@ mod test {
         let admin = Address::generate(&env);
         let user = Address::generate(&env);
         client.initialize(&admin);
-        (env, client, admin, user)
+        (env, client, id, admin, user)
     }
 
-    fn setup_without_mocked_auth() -> (Env, LendingContractClient<'static>, Address, Address) {
+    fn setup_without_mocked_auth(
+    ) -> (Env, LendingContractClient<'static>, Address, Address, Address) {
         let env = Env::default();
         let id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &id);
         let admin = Address::generate(&env);
         let user = Address::generate(&env);
         client.initialize(&admin);
-        (env, client, admin, user)
+        (env, client, id, admin, user)
     }
 
     #[test]
     fn test_initialize_and_get_admin() {
-        let (_env, client, admin, _user) = setup();
+        let (_env, client, _id, admin, _user) = setup();
         assert_eq!(client.get_admin(), admin);
     }
 
     #[test]
     fn test_deposit_increases_balance() {
-        let (_env, client, _admin, user) = setup();
+        let (_env, client, _id, _admin, user) = setup();
         let result = client.deposit(&user, &100);
         assert_eq!(result, 100);
         let again = client.deposit(&user, &50);
@@ -161,7 +162,7 @@ mod test {
 
     #[test]
     fn test_withdraw_decreases_balance() {
-        let (_env, client, _admin, user) = setup();
+        let (_env, client, _id, _admin, user) = setup();
         client.deposit(&user, &100);
         let result = client.withdraw(&user, &40);
         assert_eq!(result, 60);
@@ -169,14 +170,14 @@ mod test {
 
     #[test]
     fn test_borrow_increases_debt() {
-        let (_env, client, _admin, user) = setup();
+        let (_env, client, _id, _admin, user) = setup();
         let result = client.borrow(&user, &50);
         assert_eq!(result, 50);
     }
 
     #[test]
     fn test_repay_decreases_debt() {
-        let (_env, client, _admin, user) = setup();
+        let (_env, client, _id, _admin, user) = setup();
         client.borrow(&user, &100);
         let result = client.repay(&user, &30);
         assert_eq!(result, 70);
@@ -184,7 +185,7 @@ mod test {
 
     #[test]
     fn test_position_summary_reflects_state() {
-        let (_env, client, _admin, user) = setup();
+        let (_env, client, _id, _admin, user) = setup();
         client.deposit(&user, &200);
         client.borrow(&user, &75);
         let pos = client.get_position(&user);
@@ -194,7 +195,7 @@ mod test {
 
     #[test]
     fn test_position_summary_default_zero() {
-        let (_env, client, _admin, user) = setup();
+        let (_env, client, _id, _admin, user) = setup();
         let pos = client.get_position(&user);
         assert_eq!(pos.collateral, 0);
         assert_eq!(pos.debt, 0);
@@ -202,17 +203,21 @@ mod test {
 
     #[test]
     fn test_reentrancy_lock_blocks_nested_mutation() {
-        let (env, client, _admin, user) = setup();
+        let (env, client, id, _admin, user) = setup();
         client.deposit(&user, &100);
 
-        env.storage().temporary().set(&REENTRANCY_LOCK_KEY, &true);
+        env.as_contract(&id, || {
+            env.storage().temporary().set(&REENTRANCY_LOCK_KEY, &true);
+        });
         assert!(client.try_withdraw(&user, &10).is_err());
-        env.storage().temporary().remove(&REENTRANCY_LOCK_KEY);
+        env.as_contract(&id, || {
+            env.storage().temporary().remove(&REENTRANCY_LOCK_KEY);
+        });
     }
 
     #[test]
     fn test_reentrancy_lock_released_after_revert_path() {
-        let (env, client, _admin, user) = setup_without_mocked_auth();
+        let (env, client, _id, _admin, user) = setup_without_mocked_auth();
 
         assert!(client.try_deposit(&user, &10).is_err());
 
