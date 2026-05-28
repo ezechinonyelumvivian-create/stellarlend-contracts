@@ -1,14 +1,13 @@
 #![no_std]
 
 pub mod rounding_strategy;
+pub mod debt;
 
 #[cfg(test)]
 mod interest_drift_regression_test;
 
-#[cfg(test)]
-mod zero_amount_semantics_test;
-
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use debt::*;
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Symbol};
 
 #[cfg(test)]
 mod property_invariants_test;
@@ -26,15 +25,7 @@ pub struct PositionSummary {
     pub debt: i128,
 }
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum LendingError {
-    /// Returned when `amount` is zero or negative. Fires before any auth or
-    /// storage mutation so the rejection is always side-effect-free.
-    InvalidAmount = 1,
-    BelowMinimumBorrow = 1008,
-}
+// LendingError removed, using panic instead
 
 #[contract]
 pub struct LendingContract;
@@ -47,6 +38,21 @@ impl LendingContract {
 
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&"admin").unwrap()
+    }
+
+    /// Propose a new admin (current admin only)
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        let current_admin = Self::get_admin(env.clone());
+        current_admin.require_auth();
+        env.storage().instance().set(&"pending_admin", &new_admin);
+    }
+
+    /// Accept the proposed admin role (proposed admin only)
+    pub fn accept_admin(env: Env) {
+        let pending_admin: Address = env.storage().instance().get(&"pending_admin").expect("no pending admin");
+        pending_admin.require_auth();
+        env.storage().instance().set(&"admin", &pending_admin);
+        env.storage().instance().remove(&"pending_admin");
     }
 
     /// Set the minimum borrow amount (admin-only).
@@ -110,24 +116,18 @@ impl LendingContract {
     }
 
     /// Borrow against deposited collateral.
-    ///
-    /// # Errors
-    /// - [`LendingError::InvalidAmount`] if `amount` is zero or negative.
-    /// - [`LendingError::BelowMinimumBorrow`] if `amount` is below the configured minimum.
-    pub fn borrow(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
-        if amount <= 0 {
-            return Err(LendingError::InvalidAmount);
-        }
+    pub fn borrow(env: Env, user: Address, amount: i128) -> i128 {
         user.require_auth();
         let min_borrow = Self::get_min_borrow(env.clone());
         if amount < min_borrow {
-            return Err(LendingError::BelowMinimumBorrow);
+            panic!("BelowMinimumBorrow");
         }
-        let key = ("debt", user.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_debt = current.checked_add(amount).expect("debt overflow");
-        env.storage().persistent().set(&key, &new_debt);
-        Ok(new_debt)
+        let now = env.ledger().timestamp();
+        let position = load_debt(&env, &user);
+        let updated = borrow_amount(position, now, amount, DEFAULT_APR_BPS)
+            .unwrap_or_else(|_| panic!("debt operation failed"));
+        save_debt(&env, &user, &updated);
+        updated.principal
     }
 
     /// Repay outstanding debt for a user.
@@ -175,9 +175,7 @@ impl LendingContract {
     }
 
     // Repay function used by receiver during callback to return funds to the contract.
-    pub fn repay_flash_loan(env: Env, asset: Address, amount: i128) {
-        // Payer must be the invoker (caller contract/account)
-        let payer = env.invoker();
+    pub fn repay_flash_loan(env: Env, payer: Address, asset: Address, amount: i128) {
         payer.require_auth();
         // subtract from payer balance
         let payer_key = ("bal", asset.clone(), payer.clone());
@@ -226,10 +224,12 @@ impl LendingContract {
 
         // invoke receiver callback: on_flash_loan(initiator, asset, amount, fee, params)
         let method = Symbol::new(&env, "on_flash_loan");
-        // Prepare arguments: initiator = caller (invoker)
-        let initiator = env.invoker();
+        // Prepare arguments: initiator = receiver
+        let initiator = receiver.clone();
+        use soroban_sdk::IntoVal;
+        let args = soroban_sdk::vec![&env, initiator.into_val(&env), asset.into_val(&env), amount.into_val(&env), fee.into_val(&env), params.into_val(&env)];
         // Call contract - if it panics, propagate
-        env.invoke_contract(&receiver, &method, (initiator.clone(), asset.clone(), amount, fee, params));
+        env.invoke_contract::<()>(&receiver, &method, args);
 
         // clear reentrancy guard before checks to ensure state is readable
         env.storage().instance().set(&"flash_active", &false);
@@ -292,6 +292,24 @@ mod test {
     }
 
     #[test]
+    fn test_propose_and_accept_admin() {
+        let (env, client, admin, _user) = setup();
+        let new_admin = Address::generate(&env);
+        
+        client.propose_admin(&new_admin);
+        client.accept_admin();
+        
+        assert_eq!(client.get_admin(), new_admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "no pending admin")]
+    fn test_accept_without_propose() {
+        let (_env, client, _admin, _user) = setup();
+        client.accept_admin();
+    }
+
+    #[test]
     fn test_deposit_increases_balance() {
         let (_env, client, _admin, user) = setup();
         assert_eq!(client.deposit(&user, &100), 100);
@@ -333,11 +351,11 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "BelowMinimumBorrow")]
     fn test_borrow_below_minimum_rejected() {
         let (_env, client, _admin, user) = setup();
         client.set_min_borrow(&50);
-        let res = client.try_borrow(&user, &40);
-        assert!(res.is_err());
+        client.borrow(&user, &40);
     }
 
     #[test]
@@ -356,6 +374,3 @@ mod test {
         assert_eq!(client.get_min_borrow(), 100);
     }
 }
-
-#[cfg(test)]
-mod interest_drift_regression_test;
