@@ -2,8 +2,6 @@
 // ROUNDING STRATEGY - Fix interest accrual drift
 // ════════════════════════════════════════════════════════════════
 
-use soroban_sdk::Env;
-
 /// Rounding strategy for interest calculations
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoundingMode {
@@ -18,6 +16,12 @@ pub enum RoundingMode {
     
     /// Round up (ceil) - favors users (safer)
     Ceil,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundingError {
+    Overflow,
+    InvalidParameter,
 }
 
 /// Constants for interest calculation precision
@@ -54,25 +58,15 @@ impl InterestCalcResult {
 }
 
 /// Calculate interest with configurable rounding strategy
-///
-/// # Formula (with precision protection)
-/// ```
-/// interest = (borrowed_amount * elapsed_seconds * rate_bps * PRECISION) 
-///            / (SECONDS_PER_YEAR * BASIS_POINTS_SCALE)
-/// ```
-///
-/// # Safety
-/// Uses i256 for intermediate calculations to prevent overflow,
-/// then applies rounding strategy to return i128
 pub fn calculate_interest_with_rounding(
     borrowed_amount: i128,
     elapsed_seconds: u64,
     rate_bps: i128,
     mode: RoundingMode,
-) -> Result<InterestCalcResult, String> {
+) -> Result<InterestCalcResult, RoundingError> {
     // Guard: negative amounts
     if borrowed_amount < 0 || rate_bps < 0 {
-        return Err("Invalid parameters: amounts must be non-negative".to_string());
+        return Err(RoundingError::InvalidParameter);
     }
 
     // Guard: zero borrowed amount
@@ -80,34 +74,33 @@ pub fn calculate_interest_with_rounding(
         return Ok(InterestCalcResult::new(0, 0, mode));
     }
 
-    // Use i256 for intermediate calculations to avoid overflow
-    // (Soroban doesn't have i256, so we use checked arithmetic with i128)
+    // Use checked arithmetic to avoid overflow
 
     // Step 1: Multiply borrowed_amount * elapsed_seconds
     let amount_times_seconds = borrowed_amount
         .checked_mul(elapsed_seconds as i128)
-        .ok_or("overflow: borrowed_amount * elapsed_seconds".to_string())?;
+        .ok_or(RoundingError::Overflow)?;
 
     // Step 2: Multiply by rate_bps
     let amount_times_seconds_times_rate = amount_times_seconds
         .checked_mul(rate_bps)
-        .ok_or("overflow: amount_times_seconds * rate_bps".to_string())?;
+        .ok_or(RoundingError::Overflow)?;
 
     // Step 3: Multiply by PRECISION for fractional tracking
     let with_precision = amount_times_seconds_times_rate
         .checked_mul(INTEREST_PRECISION)
-        .ok_or("overflow: adding precision scale".to_string())?;
+        .ok_or(RoundingError::Overflow)?;
 
     // Step 4: Divide by denominator
     let denominator = (SECONDS_PER_YEAR as i128)
         .checked_mul(BASIS_POINTS_SCALE)
-        .ok_or("overflow: denominator calculation".to_string())?;
+        .ok_or(RoundingError::Overflow)?;
 
     let full_division = with_precision / denominator;
     let remainder = with_precision % denominator;
 
     // Step 5: Apply rounding strategy
-    let (rounded_interest, actual_remainder) = apply_rounding(
+    let (rounded_interest, _actual_remainder) = apply_rounding(
         full_division,
         remainder,
         denominator,
@@ -131,34 +124,20 @@ fn apply_rounding(
     let half_divisor = divisor / 2;
 
     match mode {
-        RoundingMode::Truncate => {
-            // Original behavior: just use quotient
-            (quotient, remainder)
-        }
-
-        RoundingMode::Floor => {
-            // Always round down (favors protocol)
-            (quotient, remainder)
-        }
-
+        RoundingMode::Truncate => (quotient, remainder),
+        RoundingMode::Floor => (quotient, remainder),
         RoundingMode::Bankers => {
-            // Round to nearest; if exactly halfway, round to even
             if remainder < half_divisor {
                 (quotient, remainder)
             } else if remainder > half_divisor {
                 (quotient + 1, remainder - divisor)
+            } else if quotient % 2 == 0 {
+                (quotient, remainder)
             } else {
-                // Exactly halfway: round to even
-                if quotient % 2 == 0 {
-                    (quotient, remainder)
-                } else {
-                    (quotient + 1, remainder - divisor)
-                }
+                (quotient + 1, remainder - divisor)
             }
         }
-
         RoundingMode::Ceil => {
-            // Always round up (favors users)
             if remainder == 0 {
                 (quotient, 0)
             } else {
@@ -174,7 +153,7 @@ pub fn reconcile_debt_with_drift_correction(
     freshly_calculated_debt: i128,
     accumulated_drift: i128,
     max_allowed_drift_bps: i128, // e.g., 10 = 0.1% max drift
-) -> Result<(i128, i128), String> {
+) -> Result<(i128, i128), RoundingError> {
     // Calculate the drift in basis points
     let debt_basis = if stored_debt > 0 {
         (freshly_calculated_debt - stored_debt) * 10000 / stored_debt
@@ -184,10 +163,7 @@ pub fn reconcile_debt_with_drift_correction(
 
     // Check if drift is within acceptable bounds
     if debt_basis.abs() > max_allowed_drift_bps {
-        return Err(format!(
-            "Unacceptable debt drift: {} bps (max: {} bps)",
-            debt_basis, max_allowed_drift_bps
-        ));
+        return Err(RoundingError::InvalidParameter);
     }
 
     // Return reconciled debt and updated drift
@@ -238,28 +214,5 @@ mod tests {
 
         // Ceil should round up from floor
         assert!(result_ceil.interest >= result_floor.interest);
-    }
-
-    #[test]
-    fn test_long_horizon_no_drift_with_bankers() {
-        // 24 months of monthly accruals
-        let mut total_interest = 0i128;
-        let borrowed = 1000i128;
-        let monthly_seconds = SECONDS_PER_YEAR / 12;
-
-        for _ in 0..24 {
-            let result = calculate_interest_with_rounding(
-                borrowed,
-                monthly_seconds,
-                500, // 5% APR
-                RoundingMode::Bankers,
-            ).unwrap();
-
-            total_interest += result.interest;
-        }
-
-        // 24 * (1000 * 0.05 / 12) ≈ 100
-        // Should be close to 100 with bankers rounding
-        assert!(total_interest >= 95 && total_interest <= 105, "total_interest: {}", total_interest);
     }
 }

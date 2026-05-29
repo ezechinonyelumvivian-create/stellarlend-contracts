@@ -173,6 +173,9 @@ risk parameters. There is no cross-user contamination — pinned by the
 - Views never mutate state, never charge fees, and never trigger external
   contract calls beyond the read-only oracle lookup. Callers may safely
   invoke them off-chain.
+- The protocol separately enforces a withdraw invariant: users may not
+  withdraw more collateral than they own, and withdrawals that would leave
+  collateral below the minimum collateral ratio (currently 1.0, or 100%) are rejected.
 - Integrators MUST NOT rely on a view's value beyond the ledger height at
   which it was observed. Oracle prices and risk parameters can change.
 

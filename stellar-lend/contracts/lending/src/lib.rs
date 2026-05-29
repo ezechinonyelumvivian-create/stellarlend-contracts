@@ -1,11 +1,16 @@
 #![no_std]
 
 pub mod rounding_strategy;
+mod debt;
+
+use crate::debt::{DebtPosition, load_debt, save_debt, repay_amount, effective_debt, DEFAULT_APR_BPS};
 
 #[cfg(test)]
 mod interest_drift_regression_test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, Symbol, Bytes, Vec, Val, IntoVal};
+
+const MIN_COLLATERAL_RATIO_BPS: i128 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -19,6 +24,7 @@ pub struct PositionSummary {
 #[repr(u32)]
 pub enum LendingError {
     BelowMinimumBorrow = 1008,
+    InsufficientCollateral = 1009,
 }
 
 #[contract]
@@ -64,7 +70,12 @@ impl LendingContract {
         new_balance
     }
 
-    pub fn withdraw(env: Env, user: Address, amount: i128) -> i128 {
+    /// Withdraw collateral for a user.
+    ///
+    /// This operation enforces two invariants:
+    /// 1. The requested amount cannot exceed the user's current collateral balance.
+    /// 2. The remaining collateral must satisfy the minimum collateral ratio relative to outstanding debt.
+    pub fn withdraw(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
         // Prevent mutating during an active flash loan callback
         let active: bool = env.storage().instance().get(&"flash_active").unwrap_or(false);
         if active {
@@ -73,9 +84,25 @@ impl LendingContract {
         user.require_auth();
         let key = ("col", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current - amount;
-        env.storage().persistent().set(&key, &new_balance);
-        new_balance
+        if amount > current {
+            return Err(LendingError::InsufficientCollateral);
+        }
+        
+        let position = load_debt(&env, &user);
+        let debt = effective_debt(&position, env.ledger().timestamp(), DEFAULT_APR_BPS)
+            .unwrap_or(position.principal);
+        
+        let remaining = current - amount;
+        if debt > 0 {
+            // Enforcement of minimum collateral ratio. 10000 = 1.0 = 100%.
+            // remaining_collateral must be at least debt * ratio.
+            let required = debt * MIN_COLLATERAL_RATIO_BPS / 10_000;
+            if remaining < required {
+                return Err(LendingError::InsufficientCollateral);
+            }
+        }
+        env.storage().persistent().set(&key, &remaining);
+        Ok(remaining)
     }
 
     /// Borrow against deposited collateral.
@@ -85,11 +112,16 @@ impl LendingContract {
         if amount < min_borrow {
             return Err(LendingError::BelowMinimumBorrow);
         }
-        let key = ("debt", user.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_debt = current + amount;
-        env.storage().persistent().set(&key, &new_debt);
-        Ok(new_debt)
+        
+        let now = env.ledger().timestamp();
+        let position = load_debt(&env, &user);
+        
+        // Use the business logic in debt.rs to update principal with interest and add new borrow
+        let updated = crate::debt::borrow_amount(position, now, amount, DEFAULT_APR_BPS)
+            .unwrap_or_else(|_| panic_with_debt_error());
+            
+        save_debt(&env, &user, &updated);
+        Ok(updated.principal)
     }
 
     pub fn repay(env: Env, user: Address, amount: i128) -> i128 {
@@ -130,9 +162,8 @@ impl LendingContract {
     }
 
     // Repay function used by receiver during callback to return funds to the contract.
-    pub fn repay_flash_loan(env: Env, asset: Address, amount: i128) {
-        // Payer must be the invoker (caller contract/account)
-        let payer = env.invoker();
+    // Repay function used by receiver during callback to return funds to the contract.
+    pub fn repay_flash_loan(env: Env, payer: Address, asset: Address, amount: i128) {
         payer.require_auth();
         // subtract from payer balance
         let payer_key = ("bal", asset.clone(), payer.clone());
@@ -151,11 +182,13 @@ impl LendingContract {
     /// and ensure repayment of principal + fee before returning.
     pub fn flash_loan(
         env: Env,
+        initiator: Address,
         receiver: Address,
         asset: Address,
         amount: i128,
         params: Bytes,
     ) {
+        initiator.require_auth();
         // Check liquidity
         let tre_key = ("treasury", asset.clone());
         let tre_bal: i128 = env.storage().persistent().get(&tre_key).unwrap_or(0);
@@ -181,10 +214,8 @@ impl LendingContract {
 
         // invoke receiver callback: on_flash_loan(initiator, asset, amount, fee, params)
         let method = Symbol::new(&env, "on_flash_loan");
-        // Prepare arguments: initiator = caller (invoker)
-        let initiator = env.invoker();
         // Call contract - if it panics, propagate
-        env.invoke_contract(&receiver, &method, (initiator.clone(), asset.clone(), amount, fee, params));
+        env.invoke_contract::<Val>(&receiver, &method, soroban_sdk::vec![&env, initiator.into_val(&env), asset.into_val(&env), amount.into_val(&env), fee.into_val(&env), params.into_val(&env)]);
 
         // clear reentrancy guard before checks to ensure state is readable
         env.storage().instance().set(&"flash_active", &false);
@@ -264,6 +295,32 @@ mod test {
     }
 
     #[test]
+    fn test_withdraw_fails_when_over_withdrawing() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &50);
+        let result = client.try_withdraw(&user, &75);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_withdraw_fails_when_debt_exceeds_remaining_collateral() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &100);
+        client.borrow(&user, &100);
+        let result = client.try_withdraw(&user, &1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_withdraw_to_exact_ratio_boundary_succeeds() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &100);
+        client.borrow(&user, &100);
+        let result = client.withdraw(&user, &0);
+        assert_eq!(result, 100);
+    }
+
+    #[test]
     fn test_borrow_increases_debt() {
         let (_env, client, _admin, user) = setup();
         let result = client.borrow(&user, &50);
@@ -320,6 +377,3 @@ mod test {
         assert_eq!(client.get_min_borrow(), 100);
     }
 }
-
-#[cfg(test)]
-mod interest_drift_regression_test;
