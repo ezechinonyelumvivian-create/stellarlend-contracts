@@ -114,20 +114,8 @@ pub struct LendingContract;
 #[contractimpl]
 impl LendingContract {
     pub fn initialize(env: Env, admin: Address) {
-<<<<<<< HEAD
-        if env.storage().instance().has(&"admin") {
-            panic!("AlreadyInitialized");
-        }
-        env.storage().instance().set(&"admin", &admin);
-        // initialize emergency state to Normal
-        env.storage().instance().set(
-            &Symbol::new(&env, "EmergencyState"),
-            &EmergencyState::Normal,
-        );
-=======
         env.storage().instance().set(&DataKey::Admin, &admin);
         set_emergency_state_internal(&env, EmergencyState::Normal);
->>>>>>> f6bcee0 (feat: complete global emergency circuit breaker and unify instance storage hooks #831)
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -444,12 +432,8 @@ impl LendingContract {
             (initiator.clone(), asset.clone(), amount, fee, params).into_val(&env),
         );
 
-<<<<<<< HEAD
-        env.storage().instance().set(&"flash_active", &false);
-=======
         // clear reentrancy guard before checks to ensure state is readable
         env.storage().instance().set(&DataKey::FlashActive, &false);
->>>>>>> f6bcee0 (feat: complete global emergency circuit breaker and unify instance storage hooks #831)
 
         let final_tre: i128 = env.storage().persistent().get(&tre_key).unwrap_or(0);
         let required_balance = tre_bal.checked_add(fee)
@@ -490,8 +474,6 @@ impl LendingContract {
     }
 }
 
-<<<<<<< HEAD
-=======
 fn get_emergency_state(env: &Env) -> EmergencyState {
     env.storage()
         .instance()
@@ -523,7 +505,6 @@ fn panic_with_debt_error() -> ! {
     panic!("debt operation failed");
 }
 
->>>>>>> f6bcee0 (feat: complete global emergency circuit breaker and unify instance storage hooks #831)
 #[cfg(test)]
 mod test {
     use super::*;
