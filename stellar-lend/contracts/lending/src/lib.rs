@@ -2,6 +2,7 @@
 
 mod debt;
 pub mod rounding_strategy;
+pub mod math;
 
 #[cfg(test)]
 mod interest_drift_regression_test;

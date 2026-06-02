@@ -335,3 +335,75 @@ If a malicious proposal reaches the approval threshold:
 2. Review all pending proposals for approvals from the compromised key.
 3. Cancel any proposals that were approved by the compromised key if their
    legitimacy is in doubt.
+
+
+### Snapshot Testing
+
+## Overview
+
+Soroban tests generate deterministic JSON snapshots in test_snapshots/ directories. These snapshots capture the ledger state at the end of each test and must be committed and kept in sync with the contract code. Drift between committed snapshots and freshly generated output indicates an unintended change in contract behavior.
+
+## How Snapshots Work
+The Soroban Rust SDK automatically writes snapshots to test_snapshots/<test_name>.<n>.json when tests use the Env. These files contain:
+Ledger entries: Contract data, token balances, persistent storage
+Contract events: Emitted events with topics and data
+Authorization contexts: Auth trees and signatures
+Budget/resource usage: CPU and memory metrics
+
+Running Snapshot Checks Locally
+# Check for drift (fails if snapshots differ from fresh runs)
+SNAPSHOT_CHECK=1 ./scripts/check-snapshots.sh
+
+# Warning only (does not fail)
+SNAPSHOT_CHECK=0 ./scripts/check-snapshots.sh
+
+Regenerating Snapshots (Intentional Changes)
+
+When you modify contract logic that legitimately changes the snapshot output:
+# 1. Regenerate all snapshots for both crates
+./scripts/regenerate-snapshots.sh
+
+# 2. Review the diff carefully
+# Ensure every change is expected and explained by your code changes
+git diff stellar-lend/contracts/*/test_snapshots/
+
+# 3. Commit the updated snapshots
+git add stellar-lend/contracts/*/test_snapshots/
+git commit -m "chore: regenerate test snapshots for <describe change>"
+
+## CI Failure Recovery
+1. If CI fails with SNAPSHOT DRIFT DETECTED:
+Check if drift is intentional: Did your PR change contract logic?
+Yes: Run ./scripts/regenerate-snapshots.sh, review every diff line, commit.
+No: Your change introduced unintended behavior. Fix the code, do not regenerate.
+2. Never blindly regenerate: Always review the diff to ensure changes match your intent.
+3. Common causes of unintended drift:
+Changed Env setup in tests (timestamps, ledgers)
+Modified contract state transitions
+Updated SDK version changing snapshot format
+Non-deterministic test data (random values, unmocked time)
+
+
+## Snapshot File Format
+test_snapshots/
+└── test/
+    └── test_name.1.json          # First snapshot assertion in test_name
+    └── test_name.2.json          # Second snapshot assertion (if multiple)
+    └── test_other.1.json
+    Each .json file contains a complete ledger state dump. The filename pattern is:
+
+    test_name — The Rust test function name
+.1, .2 — Snapshot index (incremented per env assertion in the test)
+
+
+## Troubleshooting
+| Symptom                            | Cause                            | Fix                                                       |
+| ---------------------------------- | -------------------------------- | --------------------------------------------------------- |
+| `diff: No such file or directory`  | Missing `test_snapshots/` dir    | Run tests locally first to generate baseline, then commit |
+| All snapshots show as "new"        | `.gitignore` excluding snapshots | Remove `test_snapshots/` from `.gitignore`                |
+| Non-deterministic diffs            | Random data in tests             | Use fixed seeds, mock `Env` timestamps, avoid `rand`      |
+| Large diffs across all tests       | SDK version change               | Regenerate once, commit alongside SDK upgrade PR          |
+| CI passes locally but fails remote | Different Rust version           | Pin `rust-toolchain.toml` to exact version                |
+
+
+
