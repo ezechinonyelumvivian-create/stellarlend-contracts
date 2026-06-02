@@ -186,3 +186,42 @@ risk parameters. There is no cross-user contamination — pinned by the
 ```
 feat: implement health factor and view functions with tests and docs
 ```
+
+---
+
+## 7. `get_protocol_metrics() -> ProtocolMetrics`
+
+- **Purpose:** Returns a single consistent protocol-wide snapshot for off-chain consumers (APIs, dashboards, liquidation bots). Replaces any per-user aggregation in the off-chain layer with a single O(1) contract read.
+- **Read-only:** Yes. No state changes.
+- **Returns:** A `ProtocolMetrics` struct with:
+  - `total_supply: i128` — Total collateral deposited across all users (sourced from the `TotalDeposits` aggregate key, updated on every `deposit`).
+  - `total_borrow: i128` — Total debt principal outstanding across all users (sourced from the `TotalDebt` aggregate key, incremented on `borrow` and decremented on `repay`).
+  - `utilization_bps: i128` — Utilization rate in basis points: `(total_borrow × 10_000) / total_supply`. Returns `0` when `total_supply` is zero.
+  - `ledger: u32` — Ledger sequence number at the moment the view was evaluated, allowing callers to detect stale reads.
+
+### Field semantics
+
+| Field | Type | Scale | Notes |
+|-------|------|-------|-------|
+| `total_supply` | `i128` | raw units | Sum of all `deposit` calls minus `withdraw` calls |
+| `total_borrow` | `i128` | raw units | Sum of active debt principals; does **not** include accrued interest |
+| `utilization_bps` | `i128` | BPS (0–10 000) | 10 000 = 100 %. Clamped to 0 when supply is 0 |
+| `ledger` | `u32` | ledger seq | Use to detect cross-request inconsistency |
+
+### Security and consistency
+
+- **Atomic snapshot:** All four fields are read within a single contract invocation, so they are internally consistent at the same ledger height.
+- **No interest accrual:** `total_borrow` tracks debt principal only. It will not equal the sum of `get_debt_balance` values (which include accrued interest). This is intentional; utilization is driven by principal.
+- **Concurrent-mutation safety:** Aggregate keys (`TotalDeposits`, `TotalDebt`) are updated transactionally inside `deposit`, `withdraw`, `borrow`, and `repay`, so there is no race between concurrent mutators on separate Soroban ledger closures.
+- **Integrators MUST NOT** cache the result beyond the ledger at which it was read — `total_supply` and `total_borrow` can change each ledger.
+
+### Example
+
+```rust
+let metrics = client.get_protocol_metrics();
+// metrics.total_supply    => 1_000_000
+// metrics.total_borrow    =>   500_000
+// metrics.utilization_bps =>     5_000  // 50 %
+// metrics.ledger          =>    123_456
+```
+
