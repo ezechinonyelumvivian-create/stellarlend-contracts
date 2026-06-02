@@ -11,8 +11,8 @@ use debt::{
     DEFAULT_APR_BPS,
 };
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, Env,
-    IntoVal, Symbol, Val,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
+    Env, IntoVal, Symbol, Val, Vec,
 };
 
 // Re-export common types so callers only need one import.
@@ -21,6 +21,8 @@ pub use stellar_lend_common::{LendingError, BPS_DENOM};
 /// Maximum desired persistent TTL for position entries, in ledgers.
 const PERSISTENT_TTL_LEDGERS: u32 = 1_000_000;
 const DEFAULT_DEPOSIT_CAP: i128 = 1_000_000_000_000;
+const DEFAULT_ORACLE_MAX_AGE_SECS: u64 = 300;
+const ORACLE_SIGNATURE_DOMAIN: &[u8] = b"stellar-lend:oracle-price";
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +40,8 @@ pub enum DataKey {
     BorrowMinAmount,
     Admin,
     PendingAdmin,
+    OraclePubKey,
+    OraclePrice(Address),
     EmergencyState,
     Guardian,
     PauseState(PauseType),
@@ -132,6 +136,13 @@ pub struct PositionSummary {
     pub health_factor: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PriceRecord {
+    pub price: i128,
+    pub timestamp: u64,
+}
+
 /// Protocol-wide metrics snapshot returned by `get_protocol_metrics`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +173,87 @@ impl LendingContract {
 
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
+
+    /// Set the configured oracle pubkey used to verify signed price updates.
+    pub fn set_oracle_pubkey(env: Env, pubkey: BytesN<32>) {
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::OraclePubKey, &pubkey);
+    }
+
+    /// Returns the currently configured oracle pubkey, if set.
+    pub fn get_oracle_pubkey(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::OraclePubKey)
+    }
+
+    pub fn set_price(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        price: i128,
+        timestamp: u64,
+        signature: Bytes,
+    ) -> Result<(), LendingError> {
+        let admin = Self::get_admin(env.clone());
+        caller.require_auth();
+        if caller != admin {
+            return Err(LendingError::Unauthorized);
+        }
+        if price <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        if timestamp > now || now > timestamp.saturating_add(DEFAULT_ORACLE_MAX_AGE_SECS) {
+            return Err(LendingError::StaleOracleTimestamp);
+        }
+
+        let oracle_pubkey: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OraclePubKey)
+            .ok_or(LendingError::OraclePubkeyNotSet)?;
+
+        let payload = Self::oracle_price_signature_payload(&env, &asset, price, timestamp);
+        if !env.crypto().ed25519_verify(&oracle_pubkey, &payload, &signature) {
+            return Err(LendingError::InvalidOracleSignature);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::OraclePrice(asset), &PriceRecord { price, timestamp });
+        Ok(())
+    }
+
+    pub fn get_price_record(env: Env, asset: Address) -> Option<PriceRecord> {
+        env.storage().persistent().get(&DataKey::OraclePrice(asset))
+    }
+
+    fn oracle_price_signature_payload(
+        env: &Env,
+        asset: &Address,
+        price: i128,
+        timestamp: u64,
+    ) -> Bytes {
+        let mut payload = Vec::<u8>::new(env);
+        for byte in ORACLE_SIGNATURE_DOMAIN {
+            payload.push_back(*byte);
+        }
+
+        let asset_bytes: BytesN<32> = asset.clone().to_bytes();
+        for byte in asset_bytes.to_array() {
+            payload.push_back(byte);
+        }
+
+        for byte in price.to_be_bytes() {
+            payload.push_back(byte);
+        }
+        for byte in timestamp.to_be_bytes() {
+            payload.push_back(byte);
+        }
+
+        payload.into()
     }
 
     /// Propose a new admin (current admin only).
@@ -760,6 +852,8 @@ fn check_emergency_status(env: &Env, action: ProtocolAction) {
 #[cfg(test)]
 mod test {
     use super::*;
+    use ed25519_dalek::{Keypair, Signer};
+    use rand::{rngs::StdRng, SeedableRng};
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::LedgerInfo;
 
@@ -784,6 +878,33 @@ mod test {
         li.timestamp = li.timestamp.saturating_add(seconds);
         li.sequence_number = li.sequence_number.saturating_add(seconds as u32);
         env.ledger().set(li);
+    }
+
+    fn build_oracle_payload(asset: &Address, price: i128, timestamp: u64) -> Vec<u8> {
+        let mut payload = ORACLE_SIGNATURE_DOMAIN.to_vec();
+        let asset_bytes: BytesN<32> = asset.clone().to_bytes();
+        payload.extend_from_slice(&asset_bytes.to_array());
+        payload.extend_from_slice(&price.to_be_bytes());
+        payload.extend_from_slice(&timestamp.to_be_bytes());
+        payload
+    }
+
+    fn chrono_keypair() -> Keypair {
+        let seed = [42u8; 32];
+        let mut rng = StdRng::from_seed(seed);
+        Keypair::generate(&mut rng)
+    }
+
+    fn sign_oracle_update(
+        env: &Env,
+        keypair: &Keypair,
+        asset: &Address,
+        price: i128,
+        timestamp: u64,
+    ) -> Bytes {
+        let payload = build_oracle_payload(asset, price, timestamp);
+        let signature = keypair.sign(&payload);
+        Bytes::from_array(env, &signature.to_bytes())
     }
 
     // -----------------------------------------------------------------------
@@ -823,6 +944,66 @@ mod test {
         assert!(
             matches!(res, Err(Ok(LendingError::InvalidFeeBps))),
             "expected InvalidFeeBps, got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn test_set_price_with_valid_signature_succeeds() {
+        let (env, client, admin, _user) = setup();
+        let keypair = chrono_keypair();
+        let pubkey = BytesN::from_array(&env, &keypair.public.to_bytes());
+        client.set_oracle_pubkey(&pubkey);
+
+        let asset = Address::generate(&env);
+        let price = 1_500_000_000i128;
+        let timestamp = env.ledger().timestamp();
+        let signature = sign_oracle_update(&env, &keypair, &asset, price, timestamp);
+
+        client.set_price(&admin, &asset, &price, &timestamp, &signature).unwrap();
+        let record = client.get_price_record(&asset).expect("price record stored");
+        assert_eq!(record.price, price);
+        assert_eq!(record.timestamp, timestamp);
+    }
+
+    #[test]
+    fn test_set_price_rejects_bad_signature() {
+        let (env, client, admin, _user) = setup();
+        let keypair = chrono_keypair();
+        let bad_keypair = Keypair::generate(&mut StdRng::from_seed([43u8; 32]));
+        let pubkey = BytesN::from_array(&env, &keypair.public.to_bytes());
+        client.set_oracle_pubkey(&pubkey);
+
+        let asset = Address::generate(&env);
+        let price = 1_000_000_000i128;
+        let timestamp = env.ledger().timestamp();
+        let signature = sign_oracle_update(&env, &bad_keypair, &asset, price, timestamp);
+
+        let res = client.try_set_price(&admin, &asset, &price, &timestamp, &signature);
+        assert!(
+            matches!(res, Err(Ok(LendingError::InvalidOracleSignature))),
+            "expected InvalidOracleSignature, got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn test_set_price_rejects_stale_timestamp() {
+        let (env, client, admin, _user) = setup();
+        let keypair = chrono_keypair();
+        let pubkey = BytesN::from_array(&env, &keypair.public.to_bytes());
+        client.set_oracle_pubkey(&pubkey);
+
+        advance_time(&env, DEFAULT_ORACLE_MAX_AGE_SECS + 10);
+        let asset = Address::generate(&env);
+        let timestamp = env.ledger().timestamp().saturating_sub(DEFAULT_ORACLE_MAX_AGE_SECS + 1);
+        let price = 1_000_000_000i128;
+        let signature = sign_oracle_update(&env, &keypair, &asset, price, timestamp);
+
+        let res = client.try_set_price(&admin, &asset, &price, &timestamp, &signature);
+        assert!(
+            matches!(res, Err(Ok(LendingError::StaleOracleTimestamp))),
+            "expected StaleOracleTimestamp, got {:?}",
             res
         );
     }
