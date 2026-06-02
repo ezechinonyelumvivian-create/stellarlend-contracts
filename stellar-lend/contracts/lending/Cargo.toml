@@ -15,7 +15,7 @@ stellar-lend-common = { path = "../common" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-proptest = "1.5"
+proptest = { workspace = true }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
