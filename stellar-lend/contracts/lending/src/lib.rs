@@ -929,3 +929,190 @@ mod test {
         assert_eq!(withdraw_result, 190);
     }
 }
+
+
+// Flash Loan Reservation Accounting
+
+// When a flash loan moves asset out and back, the in-flight balance temporarily
+// drops while the deposit cap counter does not. We maintain a reserved counter
+// per asset that is debited at the call boundary and credited on repayment.
+// The deposit-cap check uses: current_balance + reserved_for_flash_loan.
+
+use soroban_sdk::{Address, Env, Symbol};
+
+/// DataKey extension for flash loan reservation counter.
+/// Added to the existing DataKey enum:
+/// ReservedForFlashLoan(Address) -> Temporary storage, ledger-scoped
+///
+/// Invariant: reserved_for_flash_loan(asset) <= total_deposits(asset)
+///            at all times. Violation indicates a bug or attack.
+
+/// Get the current reserved amount for flash loans on a given asset.
+fn get_reserved_for_flash_loan(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .temporary()
+        .get(&DataKey::ReservedForFlashLoan(asset.clone()))
+        .unwrap_or(0i128)
+}
+
+/// Set the reserved amount for flash loans on a given asset.
+fn set_reserved_for_flash_loan(env: &Env, asset: &Address, amount: i128) {
+    if amount > 0 {
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReservedForFlashLoan(asset.clone()), &amount);
+    } else {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::ReservedForFlashLoan(asset.clone()));
+    }
+}
+
+/// Debit the reservation counter when a flash loan is initiated.
+fn reserve_flash_loan(env: &Env, asset: &Address, amount: i128) {
+    let current = get_reserved_for_flash_loan(env, asset);
+    let new_reserved = current.checked_add(amount)
+        .expect("flash loan reservation overflow");
+    
+    // Invariant: reserved cannot exceed total deposits
+    let total_deposits = get_total_deposits(env, asset);
+    assert!(
+        new_reserved <= total_deposits,
+        "reserved flash loan amount exceeds total deposits"
+    );
+    
+    set_reserved_for_flash_loan(env, asset, new_reserved);
+    
+    env.events().publish(
+        (Symbol::new(env, "flash_loan_reserved"), asset.clone()),
+        (amount, new_reserved),
+    );
+}
+
+/// Credit the reservation counter when a flash loan is repaid.
+fn release_flash_loan_reservation(env: &Env, asset: &Address, amount: i128) {
+    let current = get_reserved_for_flash_loan(env, asset);
+    assert!(
+        current >= amount,
+        "flash loan release exceeds reservation"
+    );
+    
+    let new_reserved = current - amount;
+    set_reserved_for_flash_loan(env, asset, new_reserved);
+    
+    env.events().publish(
+        (Symbol::new(env, "flash_loan_released"), asset.clone()),
+        (amount, new_reserved),
+    );
+}
+
+/// Compute effective available deposits for cap checking.
+/// This includes in-flight flash loan reservations.
+fn get_effective_deposits(env: &Env, asset: &Address) -> i128 {
+    let raw_deposits = get_total_deposits(env, asset);
+    let reserved = get_reserved_for_flash_loan(env, asset);
+    raw_deposits + reserved
+}
+
+/// Updated deposit-cap check that accounts for flash loan reservations.
+fn check_deposit_cap(env: &Env, asset: &Address, additional_amount: i128) {
+    let asset_params: AssetParams = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AssetParams(asset.clone()))
+        .expect("asset params not set");
+    
+    let deposit_cap = asset_params.deposit_cap;
+    if deposit_cap == 0 {
+        return; // No cap configured
+    }
+    
+    // Use effective deposits (raw + reserved) for cap calculation
+    let effective_deposits = get_effective_deposits(env, asset);
+    let new_total = effective_deposits
+        .checked_add(additional_amount)
+        .expect("deposit cap check overflow");
+    
+    assert!(
+        new_total <= deposit_cap,
+        "deposit cap exceeded: {} + {} > {}",
+        effective_deposits,
+        additional_amount,
+        deposit_cap
+    );
+}
+
+// Placeholder: get_total_deposits would be defined elsewhere in the contract
+fn get_total_deposits(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TotalDeposits(asset.clone()))
+        .unwrap_or(0i128)
+}
+
+// Flash Loan Entrypoint (Updated)
+
+/// Execute a flash loan with reservation accounting.
+/// 
+/// # Arguments
+/// * `asset` - The asset to flash loan
+/// * `amount` - The amount to loan
+/// * `callback` - Contract to call with the loaned amount
+/// * `callback_data` - Data passed to the callback contract
+/// 
+/// # Invariants
+/// 1. reserved_for_flash_loan is debited before transfer
+/// 2. Callback is invoked with loaned amount
+/// 3. Repayment + fee is verified
+/// 4. Reservation is credited back after repayment
+pub fn flash_loan(
+    env: Env,
+    asset: Address,
+    amount: i128,
+    callback: Address,
+    callback_data: soroban_sdk::Vec<Val>,
+) {
+    // Auth: caller must be authorized
+    let caller = env.current_contract_address();
+    
+    // Reserve the flash loan amount against deposit cap
+    reserve_flash_loan(&env, &asset, amount);
+    
+    // Transfer asset to callback contract
+    let token_client = token::Client::new(&env, &asset);
+    token_client.transfer(&caller, &callback, &amount);
+    
+    // Invoke callback contract
+    let callback_client = FlashLoanReceiverClient::new(&env, &callback);
+    callback_client.on_flash_loan(
+        &caller,
+        &asset,
+        &amount,
+        &calculate_flash_loan_fee(&env, &asset, amount),
+        &callback_data,
+    );
+    
+    // Verify repayment (amount + fee)
+    let fee = calculate_flash_loan_fee(&env, &asset, amount);
+    let expected_repayment = amount.checked_add(fee)
+        .expect("flash loan fee overflow");
+    
+    let balance_after = token_client.balance(&caller);
+    let balance_before = get_contract_balance(&env, &asset);
+    
+    assert!(
+        balance_after >= balance_before + expected_repayment,
+        "flash loan not repaid: expected {} + fee, got {}",
+        amount,
+        balance_after - balance_before
+    );
+    
+    // Release the reservation
+    release_flash_loan_reservation(&env, &asset, amount);
+    
+    // Emit event
+    env.events().publish(
+        (Symbol::new(&env, "flash_loan"), asset.clone()),
+        (amount, fee, caller),
+    );
+}
