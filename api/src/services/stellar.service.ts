@@ -348,4 +348,60 @@ export class StellarService {
 
     return results;
   }
+
+  /**
+   * Ping the soroban RPC and attempt a lightweight contract invocation
+   * to verify contract reachability. Returns rpc, contract and ledger info.
+   */
+  async pingContract(): Promise<{ rpc: boolean; contract: boolean; ledger: number | null }> {
+    const status = { rpc: false, contract: false, ledger: null as number | null };
+
+    // Check RPC health
+    try {
+      await this.sorobanServer.getHealth();
+      status.rpc = true;
+    } catch (error) {
+      logger.error('Soroban RPC health check failed (pingContract):', error);
+      // If RPC is down we cannot proceed to contract check
+      return status;
+    }
+
+    // Try to fetch latest ledger from Horizon for diagnostic info
+    try {
+      const resp = await axios.get(`${this.horizonUrl}/ledgers?order=desc&limit=1`);
+      const latest = resp.data?._embedded?.records?.[0];
+      if (latest && latest.sequence) {
+        status.ledger = Number(latest.sequence);
+      }
+    } catch (error) {
+      logger.warn('Failed to fetch latest ledger for health check:', error);
+    }
+
+    // Attempt a lightweight contract invocation via prepareTransaction.
+    // This will exercise the Soroban RPC path for invoking the named
+    // function and will fail if the contract or RPC cannot be reached.
+    try {
+      const tempKey = Keypair.random().publicKey();
+      const account = new Account(tempKey, '1');
+      const contract = new Contract(this.contractId);
+      const operation = contract.call('get_admin');
+
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(operation)
+        .setTimeout(10)
+        .build();
+
+      // prepareTransaction will call out to the soroban RPC; success implies
+      // the contract is reachable and callable (at least for read-only).
+      await this.sorobanServer.prepareTransaction(tx);
+      status.contract = true;
+    } catch (error) {
+      logger.error('Contract ping failed (pingContract):', error);
+    }
+
+    return status;
+  }
 }

@@ -101,18 +101,24 @@ pub enum ProtocolAction {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum LendingError {
+    InvalidAmount = 1004,
+    BelowMinimumBorrow = 1008,
     InvalidAmount        = 1004,
     BelowMinimumBorrow   = 1008,
     /// Contract has not been initialized yet.
-    NotInitialized       = 1009,
+    NotInitialized = 1009,
     /// `initialize` was called a second time.
-    AlreadyInitialized   = 1010,
-    DebtCeilingExceeded  = 2001,
-    DepositCapExceeded   = 2002,
-    Overflow             = 2003,
+    AlreadyInitialized = 1010,
+    /// Not enough collateral to satisfy withdrawal
+    InsufficientCollateral = 1011,
+    DebtCeilingExceeded = 2001,
+    DepositCapExceeded = 2002,
+    Overflow = 2003,
     /// Caller is not the admin.
-    Unauthorized         = 2004,
+    Unauthorized = 2004,
     /// Fee outside the permitted range.
+    InvalidFeeBps = 2005,
+    PositionHealthy = 2006,
     InvalidFeeBps        = 2005,
     PositionHealthy      = 2006,
     InsufficientCollateral = 2007,

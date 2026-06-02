@@ -123,3 +123,19 @@ export const healthCheck = async (req: Request, res: Response, next: NextFunctio
     next(error);
   }
 };
+
+export const deepHealthCheck = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const result = await stellarService.pingContract();
+    const isHealthy = result.rpc && result.contract;
+
+    res.status(isHealthy ? 200 : 503).json({
+      rpc: result.rpc,
+      contract: result.contract,
+      ledger: result.ledger,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    next(error);
+  }
+};

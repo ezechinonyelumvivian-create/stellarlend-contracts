@@ -53,6 +53,16 @@ CB_HALF_OPEN_TRIAL=2
 ### Health Check
 `GET /api/health` - Check service status
 
+### Deep Health Check
+- `GET /api/health/healthz` - Deep liveness and readiness check. Returns structured status and diagnostic info:
+
+  - `rpc` (boolean): whether Soroban RPC responded to health probe
+  - `contract` (boolean): whether the configured lending contract is reachable (invocation)
+  - `ledger` (number|null): latest ledger sequence observed from Horizon when available
+
+  Returns HTTP `200` when both `rpc` and `contract` are true, otherwise `503`.
+
+SLO: The service aims for 99.9% availability for `/api/health/healthz` (RPC + contract reachable). Use a short scrape interval (e.g. 10s) and alert on consecutive failures for 1 minute.
 The health endpoint now includes Soroban RPC circuit breaker metrics under `services.sorobanBreaker`:
 
 ```json
