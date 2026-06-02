@@ -14,9 +14,16 @@ pub struct HelloContract;
 
 #[contractimpl]
 impl HelloContract {
-    /// Set the admin (one-time).
+    /// Set or rotate the admin.
+    ///
+    /// - If no admin exists yet, this bootstraps the contract.
+    /// - If an admin already exists, the current admin must authorize the change.
     pub fn set_admin(env: Env, admin: Address) {
-        env.storage().instance().set(&"admin", &admin);
+        let storage = env.storage().instance();
+        if let Some(current_admin) = storage.get::<_, Address>(&"admin") {
+            current_admin.require_auth();
+        }
+        storage.set(&"admin", &admin);
     }
 
     /// Get the admin (panics if not set).
@@ -89,7 +96,7 @@ impl HelloContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::Symbol;
 
     fn setup() -> (Env, HelloContractClient<'static>, Address, Address) {
@@ -147,5 +154,41 @@ mod test {
         let s = client.get_state(&user);
         assert_eq!(s.balance, 500);
         assert_eq!(s.debt, 100);
+    }
+
+    #[test]
+    fn test_set_admin_requires_current_admin_auth_for_rotation() {
+        let env = Env::default();
+        let id = env.register(HelloContract, ());
+        let client = HelloContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        let new_admin = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &id,
+                fn_name: "set_admin",
+                args: (new_admin.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        client.set_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_admin_rejects_unauthorized_rotation() {
+        let env = Env::default();
+        let id = env.register(HelloContract, ());
+        let client = HelloContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+
+        let attacker = Address::generate(&env);
+        client.set_admin(&attacker);
     }
 }
