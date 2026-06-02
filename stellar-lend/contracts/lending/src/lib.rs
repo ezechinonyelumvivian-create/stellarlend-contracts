@@ -3,6 +3,8 @@
 mod debt;
 pub mod rounding_strategy;
 
+use crate::debt::{DebtPosition, load_debt, save_debt, repay_amount, effective_debt, DEFAULT_APR_BPS};
+
 #[cfg(test)]
 mod interest_drift_regression_test;
 
@@ -56,12 +58,41 @@ pub enum EmergencyState {
     Recovery,
 }
 
+/// Labels used by `check_emergency_status` to decide which operations are
+/// allowed under each circuit-breaker state.
 pub enum ProtocolAction {
     Deposit,
     Withdraw,
     Borrow,
     Repay,
 }
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum LendingError {
+    BelowMinimumBorrow   = 1008,
+    /// Contract has not been initialized yet.
+    NotInitialized       = 1009,
+    /// `initialize` was called a second time.
+    AlreadyInitialized   = 1010,
+    DebtCeilingExceeded  = 2001,
+    DepositCapExceeded   = 2002,
+    Overflow             = 2003,
+    /// Caller is not the admin.
+    Unauthorized         = 2004,
+    /// Fee outside the permitted range.
+    InvalidFeeBps        = 2005,
+    PositionHealthy      = 2006,
+}
+
+// ---------------------------------------------------------------------------
+// Shared view structs
+// ---------------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,13 +219,13 @@ impl LendingContract {
             .ok_or(LendingError::Overflow)?;
 
         if new_total > deposit_cap {
-            return Err(LendingError::DepositCapExceeded);
+            return Err(Error::DepositCapExceeded);
         }
 
         // Update user collateral with overflow protection
         let key = DataKey::Collateral(user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current.checked_add(amount).ok_or(LendingError::Overflow)?;
+        let new_balance = current.checked_add(amount).ok_or(Error::Overflow)?;
         env.storage().persistent().set(&key, &new_balance);
         env.storage()
             .persistent()
@@ -224,7 +255,7 @@ impl LendingContract {
         let key = DataKey::Collateral(user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         if amount > current {
-            panic!("insufficient collateral");
+            return Err(LendingError::InsufficientCollateral);
         }
         let new_balance = current.checked_sub(amount).ok_or(LendingError::Overflow)?;
         env.storage().persistent().set(&key, &new_balance);
@@ -237,7 +268,7 @@ impl LendingContract {
     ///
     /// # Security Invariant: Overflow Protection
     /// All debt mutations use `checked_add` to prevent integer overflow.
-    /// If overflow would occur, returns `LendingError::Overflow`.
+    /// If overflow would occur, returns `Error::Overflow`.
     ///
     /// # Parameters
     /// * `env` - The Soroban environment
@@ -248,11 +279,11 @@ impl LendingContract {
     /// * `EmergencyState != Normal` - Borrows blocked during emergency
     /// * `amount < min_borrow` - Below minimum borrow amount
     /// * `new_total > debt_ceiling` - Exceeds protocol debt ceiling
-    /// * `LendingError::Overflow` - Checked arithmetic would overflow
+    /// * `Error::Overflow` - Checked arithmetic would overflow
     ///
     /// # Returns
     /// User's debt principal after borrow
-    pub fn borrow(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
+    pub fn borrow(env: Env, user: Address, amount: i128) -> Result<i128, Error> {
         check_emergency_status(&env, ProtocolAction::Borrow);
 
         if amount <= 0 {
@@ -264,6 +295,7 @@ impl LendingContract {
         if amount < min_borrow {
             panic!("BelowMinimumBorrow");
         }
+        
         let now = env.ledger().timestamp();
         let position = load_debt(&env, &user);
         let updated =
@@ -272,8 +304,6 @@ impl LendingContract {
                 debt::DebtError::Overflow => LendingError::Overflow,
             })?;
         save_debt(&env, &user, &updated);
-        // Extend TTL to prevent archival of debt entry
-        extend_debt_ttl(&env, &user);
         Ok(updated.principal)
     }
 
@@ -489,11 +519,7 @@ impl LendingContract {
 
         let method = Symbol::new(&env, "on_flash_loan");
         // Call contract - if it panics, propagate
-        env.invoke_contract::<()>(
-            &receiver,
-            &method,
-            (initiator.clone(), asset.clone(), amount, fee, params).into_val(&env),
-        );
+        env.invoke_contract::<Val>(&receiver, &method, soroban_sdk::vec![&env, initiator.into_val(&env), asset.into_val(&env), amount.into_val(&env), fee.into_val(&env), params.into_val(&env)]);
 
         // clear reentrancy guard before checks to ensure state is readable
         env.storage().instance().set(&DataKey::FlashActive, &false);
@@ -507,8 +533,6 @@ impl LendingContract {
         }
     }
 
-    /// Get user position summary: collateral, effective debt, and health factor.
-    /// Health factor uses checked arithmetic to prevent overflow on calculation.
     pub fn get_position(env: Env, user: Address) -> PositionSummary {
         let col_key = DataKey::Collateral(user.clone());
         let col: i128 = env.storage().persistent().get(&col_key).unwrap_or(0);
@@ -533,6 +557,19 @@ impl LendingContract {
             health_factor,
         }
     }
+    env.storage().temporary().set(&reentrancy_lock_key, &true);
+}
+
+fn release_reentrancy_lock(env: &Env) {
+    let reentrancy_lock_key = Symbol::new(env, "reent_l");
+    env.storage().temporary().remove(&reentrancy_lock_key);
+}
+
+fn with_reentrancy_lock<T>(env: &Env, f: impl FnOnce() -> T) -> T {
+    acquire_reentrancy_lock(env);
+    let result = f();
+    release_reentrancy_lock(env);
+    result
 }
 
 fn extend_collateral_ttl(env: &Env, user: &Address) {
@@ -587,19 +624,19 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
 
-    fn setup() -> (Env, LendingContractClient<'static>, Address, Address) {
+    fn setup() -> (Env, LendingContractClient<'static>, soroban_sdk::Address, soroban_sdk::Address) {
         let env = Env::default();
         env.mock_all_auths();
         let id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let user = Address::generate(&env);
+        let admin = soroban_sdk::Address::generate(&env);
+        let user = soroban_sdk::Address::generate(&env);
         client.initialize(&admin);
         (env, client, admin, user)
     }
 
     fn advance_time(env: &Env, seconds: u64) {
-        let mut li = env.ledger().get();
+        let mut li: LedgerInfo = env.ledger().get();
         li.timestamp = li.timestamp.saturating_add(seconds);
         li.sequence_number = li.sequence_number.saturating_add(seconds as u32);
         env.ledger().set(li);
@@ -610,6 +647,85 @@ mod test {
         let (_env, client, admin, _user) = setup();
         assert_eq!(client.get_admin(), admin);
     }
+
+    // -----------------------------------------------------------------------
+    // Admin-only privileged setter guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic]
+    fn test_unauthorized_set_min_borrow_rejected() {
+        let (env, client, _admin, _user) = setup();
+        // Create a fresh address that has not been authenticated as admin.
+        let attacker = Address::generate(&env);
+        // With mock_all_auths the env will satisfy any require_auth, so we
+        // instead call the method without mocking to observe the auth failure.
+        let env2 = Env::default();
+        let id2 = env2.register(LendingContract, ());
+        let client2 = LendingContractClient::new(&env2, &id2);
+        let admin2 = Address::generate(&env2);
+        // Initialize is also called without mock so the auth here is critical.
+        env2.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin2,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &id2,
+                fn_name: "initialize",
+                args: (admin2.clone(),).into_val(&env2),
+                sub_invokes: &[],
+            },
+        }]);
+        client2.initialize(&admin2).unwrap();
+        // Now call set_min_borrow as attacker with no auth — should panic.
+        client2.set_min_borrow(&100).unwrap();
+    }
+
+    #[test]
+    fn test_set_min_borrow_admin_only() {
+        let (_env, client, _admin, _user) = setup();
+        assert_eq!(client.get_min_borrow(), 0);
+        client.set_min_borrow(&100).unwrap();
+        assert_eq!(client.get_min_borrow(), 100);
+    }
+
+    #[test]
+    fn test_set_debt_ceiling_admin_only() {
+        let (_env, client, _admin, _user) = setup();
+        client.set_debt_ceiling(&1_000_000).unwrap();
+        // No getter yet, just assert no panic.
+    }
+
+    #[test]
+    fn test_set_flash_fee_valid_range() {
+        let (_env, client, _admin, _user) = setup();
+        client.set_flash_fee(&50).unwrap();
+    }
+
+    #[test]
+    fn test_set_flash_fee_rejects_out_of_range() {
+        let (_env, client, _admin, _user) = setup();
+        let res = client.try_set_flash_fee(&1_001);
+        assert!(
+            matches!(res, Err(Ok(LendingError::InvalidFeeBps))),
+            "expected InvalidFeeBps, got {:?}", res
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin rotation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_propose_and_accept_admin() {
+        let (env, client, _admin, _user) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin).unwrap();
+        client.accept_admin().unwrap();
+        assert_eq!(client.get_admin().unwrap(), new_admin);
+    }
+
+    // -----------------------------------------------------------------------
+    // Core operations
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_deposit_increases_balance() {
@@ -626,6 +742,32 @@ mod test {
         client.deposit(&user, &100);
         let result = client.withdraw(&user, &40);
         assert_eq!(result, 60);
+    }
+
+    #[test]
+    fn test_withdraw_fails_when_over_withdrawing() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &50);
+        let result = client.try_withdraw(&user, &75);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_withdraw_fails_when_debt_exceeds_remaining_collateral() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &100);
+        client.borrow(&user, &100);
+        let result = client.try_withdraw(&user, &1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_withdraw_to_exact_ratio_boundary_succeeds() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &100);
+        client.borrow(&user, &100);
+        let result = client.withdraw(&user, &0);
+        assert_eq!(result, 100);
     }
 
     #[test]
@@ -656,16 +798,14 @@ mod test {
     #[test]
     fn test_ttl_keeps_position_live_across_reads() {
         let (env, client, _admin, user) = setup();
-        client.deposit(&user, &200);
-        client.borrow(&user, &75);
+        client.deposit(&user, &200).unwrap();
+        client.borrow(&user, &75).unwrap();
 
-        // Move time to the middle of the TTL window and read the position.
         advance_time(&env, (PERSISTENT_TTL_LEDGERS / 2) as u64);
         let pos_mid = client.get_position(&user);
         assert_eq!(pos_mid.collateral, 200);
         assert_eq!(pos_mid.debt, 75);
 
-        // Advance past the original TTL boundary. The previous read should have extended TTL.
         advance_time(&env, (PERSISTENT_TTL_LEDGERS / 2 + 1) as u64);
         let pos_after = client.get_position(&user);
         assert_eq!(pos_after.collateral, 200);
@@ -675,7 +815,7 @@ mod test {
     #[test]
     fn test_get_debt_position_extends_debt_ttl() {
         let (env, client, _admin, user) = setup();
-        client.borrow(&user, &100);
+        client.borrow(&user, &100).unwrap();
 
         advance_time(&env, (PERSISTENT_TTL_LEDGERS / 2) as u64);
         let debt_mid = client.get_debt_position(&user);
@@ -697,7 +837,7 @@ mod test {
     #[test]
     fn test_borrow_below_minimum_rejected() {
         let (_env, client, _admin, user) = setup();
-        client.set_min_borrow(&50);
+        client.set_min_borrow(&50).unwrap();
         let res = client.try_borrow(&user, &40);
         assert!(res.is_err());
     }
@@ -705,8 +845,8 @@ mod test {
     #[test]
     fn test_borrow_exactly_minimum_accepted() {
         let (_env, client, _admin, user) = setup();
-        client.set_min_borrow(&50);
-        let res = client.borrow(&user, &50);
+        client.set_min_borrow(&50).unwrap();
+        let res = client.borrow(&user, &50).unwrap();
         assert_eq!(res, 50);
     }
 

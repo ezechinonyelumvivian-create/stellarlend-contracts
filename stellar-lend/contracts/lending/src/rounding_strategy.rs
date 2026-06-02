@@ -5,17 +5,16 @@
 /// Rounding strategy for interest calculations
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoundingMode {
-    /// Round towards zero (truncate) - original buggy behavior
     Truncate,
-
-    /// Round down (floor) - favors protocol
     Floor,
-
-    /// Banker's rounding (round to nearest even) - reduces bias
     Bankers,
-
-    /// Round up (ceil) - favors users (safer)
     Ceil,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundingError {
+    Overflow,
+    InvalidParameter,
 }
 
 /// Constants for interest calculation precision
@@ -23,32 +22,15 @@ pub const INTEREST_PRECISION: i128 = 1_000_000; // 6 decimal places for intermed
 pub const SECONDS_PER_YEAR: u64 = 365 * 24 * 60 * 60; // 31,536,000
 pub const BASIS_POINTS_SCALE: i128 = 10_000;
 
-/// Errors that can occur during interest calculation and reconciliation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RoundingError {
-    InvalidParameters,
-    Overflow,
-    UnacceptableDrift,
-}
-
-/// Interest calculation result with full precision tracking
 #[derive(Clone, Debug)]
 pub struct InterestCalcResult {
-    /// Final rounded interest amount
     pub interest: i128,
-
-    /// Fractional part (remainder) that was lost
     pub remainder: i128,
-
-    /// Total precision loss so far (for tracking drift)
     pub total_drift: i128,
-
-    /// Rounding mode applied
     pub mode: RoundingMode,
 }
 
 impl InterestCalcResult {
-    /// Create new result with given parameters
     pub fn new(interest: i128, remainder: i128, mode: RoundingMode) -> Self {
         InterestCalcResult {
             interest,
@@ -60,16 +42,6 @@ impl InterestCalcResult {
 }
 
 /// Calculate interest with configurable rounding strategy
-///
-/// # Formula (with precision protection)
-/// ```text
-/// interest = (borrowed_amount * elapsed_seconds * rate_bps * PRECISION)
-///            / (SECONDS_PER_YEAR * BASIS_POINTS_SCALE)
-/// ```
-///
-/// # Safety
-/// Uses i256 for intermediate calculations to prevent overflow,
-/// then applies rounding strategy to return i128
 pub fn calculate_interest_with_rounding(
     borrowed_amount: i128,
     elapsed_seconds: u64,
@@ -78,16 +50,13 @@ pub fn calculate_interest_with_rounding(
 ) -> Result<InterestCalcResult, RoundingError> {
     // Guard: negative amounts
     if borrowed_amount < 0 || rate_bps < 0 {
-        return Err(RoundingError::InvalidParameters);
+        return Err(RoundingError::InvalidParameter);
     }
-
-    // Guard: zero borrowed amount
     if borrowed_amount == 0 {
         return Ok(InterestCalcResult::new(0, 0, mode));
     }
 
-    // Use i256 for intermediate calculations to avoid overflow
-    // (Soroban doesn't have i256, so we use checked arithmetic with i128)
+    // Use checked arithmetic to avoid overflow
 
     // Step 1: Multiply borrowed_amount * elapsed_seconds
     let amount_times_seconds = borrowed_amount
@@ -113,13 +82,16 @@ pub fn calculate_interest_with_rounding(
     let remainder = with_precision % denominator;
 
     // Step 5: Apply rounding strategy
-    let (rounded_interest, _actual_remainder) =
-        apply_rounding(full_division, remainder, denominator, mode);
+    let (rounded_interest, _actual_remainder) = apply_rounding(
+        full_division,
+        remainder,
+        denominator,
+        mode,
+    );
 
     // Step 6: Back-convert from precision scale
     let final_interest = rounded_interest / INTEREST_PRECISION;
     let final_remainder = rounded_interest % INTEREST_PRECISION;
-
     Ok(InterestCalcResult::new(
         final_interest,
         final_remainder,
@@ -127,7 +99,6 @@ pub fn calculate_interest_with_rounding(
     ))
 }
 
-/// Apply rounding strategy to preserve precision
 fn apply_rounding(
     quotient: i128,
     remainder: i128,
@@ -135,36 +106,21 @@ fn apply_rounding(
     mode: RoundingMode,
 ) -> (i128, i128) {
     let half_divisor = divisor / 2;
-
     match mode {
-        RoundingMode::Truncate => {
-            // Original behavior: just use quotient
-            (quotient, remainder)
-        }
-
-        RoundingMode::Floor => {
-            // Always round down (favors protocol)
-            (quotient, remainder)
-        }
-
+        RoundingMode::Truncate => (quotient, remainder),
+        RoundingMode::Floor => (quotient, remainder),
         RoundingMode::Bankers => {
-            // Round to nearest; if exactly halfway, round to even
             if remainder < half_divisor {
                 (quotient, remainder)
             } else if remainder > half_divisor {
                 (quotient + 1, remainder - divisor)
+            } else if quotient % 2 == 0 {
+                (quotient, remainder)
             } else {
-                // Exactly halfway: round to even
-                if quotient % 2 == 0 {
-                    (quotient, remainder)
-                } else {
-                    (quotient + 1, remainder - divisor)
-                }
+                (quotient + 1, remainder - divisor)
             }
         }
-
         RoundingMode::Ceil => {
-            // Always round up (favors users)
             if remainder == 0 {
                 (quotient, 0)
             } else {
@@ -173,8 +129,6 @@ fn apply_rounding(
         }
     }
 }
-
-/// Reconcile user debt with protocol accounting using historical error tracking
 pub fn reconcile_debt_with_drift_correction(
     stored_debt: i128,
     freshly_calculated_debt: i128,
@@ -187,17 +141,12 @@ pub fn reconcile_debt_with_drift_correction(
     } else {
         0
     };
-
-    // Check if drift is within acceptable bounds
     if debt_basis.abs() > max_allowed_drift_bps {
-        return Err(RoundingError::UnacceptableDrift);
+        return Err(RoundingError::InvalidParameter);
     }
 
     // Return reconciled debt and updated drift
-    Ok((
-        freshly_calculated_debt,
-        accumulated_drift + (freshly_calculated_debt - stored_debt),
-    ))
+    Ok((freshly_calculated_debt, accumulated_drift + (freshly_calculated_debt - stored_debt)))
 }
 
 #[cfg(test)]
@@ -206,8 +155,7 @@ mod tests {
 
     #[test]
     fn test_zero_borrowed_returns_zero_interest() {
-        let result =
-            calculate_interest_with_rounding(0, 365 * 24 * 60 * 60, 500, RoundingMode::Floor);
+        let result = calculate_interest_with_rounding(0, 365 * 24 * 60 * 60, 500, RoundingMode::Floor);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().interest, 0);
     }
@@ -220,8 +168,7 @@ mod tests {
             SECONDS_PER_YEAR,
             500, // 5%
             RoundingMode::Floor,
-        )
-        .unwrap();
+        ).unwrap();
 
         // Expected: 100 * 0.05 = 5
         assert_eq!(result.interest, 5);
@@ -233,14 +180,16 @@ mod tests {
         let result_floor = calculate_interest_with_rounding(
             1000,
             SECONDS_PER_YEAR / 12, // 1 month
-            500,                   // 5% APR
+            500, // 5% APR
             RoundingMode::Floor,
-        )
-        .unwrap();
+        ).unwrap();
 
-        let result_ceil =
-            calculate_interest_with_rounding(1000, SECONDS_PER_YEAR / 12, 500, RoundingMode::Ceil)
-                .unwrap();
+        let result_ceil = calculate_interest_with_rounding(
+            1000,
+            SECONDS_PER_YEAR / 12,
+            500,
+            RoundingMode::Ceil,
+        ).unwrap();
 
         // Ceil should round up from floor
         assert!(result_ceil.interest >= result_floor.interest);

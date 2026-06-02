@@ -23,6 +23,10 @@ The versioning strategy is minimal by design:
 | `SchemaVersionEvent` | 1 | Emitted once on `initialize`. |
 | `LiquidationEventV1` | 1 | Versioned liquidation with post-liquidation borrower snapshot. |
 | `BorrowerHealthEventV1` | 1 | Borrower health snapshot emitted alongside position updates. |
+| `DepositEvent` | 1 | Versioned deposit event with user and new collateral balance. |
+| `WithdrawEvent` | 1 | Versioned withdraw event with user and new collateral balance. |
+| `BorrowEvent` | 1 | Versioned borrow event with user and new debt balance. |
+| `RepayEvent` | 1 | Versioned repay event with user and new debt balance. |
 
 All other events are unversioned (no `schema_version` field). They follow an
 additive-only policy: new fields may be appended but existing fields will not
