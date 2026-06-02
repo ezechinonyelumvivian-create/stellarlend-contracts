@@ -273,6 +273,18 @@ describe('PriceAggregator', () => {
             expect(result?.sources.every(s => s.source !== 'provider1')).toBe(true);
         });
 
+        it('should handle fallback when primary provider is in cooldown', async () => {
+            // Put provider1 in cooldown
+            mockProvider1.cooldownUntil = Date.now() + 60000;
+
+            const result = await aggregator.getPrice('XLM');
+
+            expect(result).not.toBeNull();
+            // It should skip provider1 and fetch from provider2/3 instead
+            expect(result?.sources.every(s => s.source !== 'provider1')).toBe(true);
+            expect(result?.sources.some(s => s.source === 'provider2')).toBe(true);
+        });
+
         it('should still produce a result when MAD filter would drop too many sources (fallback)', async () => {
             // Very tight threshold forces fallback to unfiltered list
             const tightAggregator = createAggregator(
