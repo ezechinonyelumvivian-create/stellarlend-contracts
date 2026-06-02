@@ -3,9 +3,9 @@
 # scripts/init.sh – Initialize deployed StellarLend contracts
 #
 # This script calls the on-chain `initialize` (and `initialize_amm_settings`)
-# entrypoints on already-deployed contracts.  It must be run exactly once per
-# deployment; a second call will be rejected by the contract with
-# `AlreadyInitialized` (error code 13).
+# entrypoints on already-deployed contracts.  It is idempotent: if the contract
+# is already initialized, the script will exit gracefully with code 0 and a
+# message indicating the current admin address.
 #
 # Usage:
 #   ADMIN_SECRET_KEY=<secret_key> \
@@ -56,8 +56,11 @@
 #   spread_bps             = 200    (2%)
 #
 # Security notes:
-#   - Never run this script more than once per deployed contract; the contract
-#     enforces this on-chain (AlreadyInitialized = error code 13).
+#   - This script is idempotent: it checks if the contract is already initialized
+#     before attempting initialization. If already initialized, it exits with
+#     code 0 and displays the current admin address.
+#   - The contract enforces single initialization on-chain (AlreadyInitialized
+#     = error code 13 / 1010 in XDR).
 #   - Rotate the admin to a multisig address before opening the protocol to
 #     public users on mainnet.
 #   - Never commit ADMIN_SECRET_KEY to version control.
@@ -119,6 +122,45 @@ if [[ "${ADMIN_SECRET_KEY:0:1}" != "S" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Pre-check: Verify if contract is already initialized
+# ---------------------------------------------------------------------------
+precheck_initialized() {
+  local contract_id="$1"
+  local network="$2"
+
+  echo ">>> Checking if contract is already initialized..."
+  echo "    Contract : $contract_id"
+
+  # Try to read the admin address using the read-only get_admin view
+  # This will fail if the contract is not initialized
+  local current_admin
+  if current_admin=$(stellar contract invoke \
+    --id "$contract_id" \
+    --source "$ADMIN_SECRET_KEY" \
+    --network "$network" \
+    "${RPC_ARGS[@]+"${RPC_ARGS[@]}"}" \
+    -- get_admin 2>/dev/null); then
+    # Admin is set - contract is already initialized
+    current_admin=$(echo "$current_admin" | tr -d '"')
+    echo "    Contract is already initialized."
+    echo "    Current admin: $current_admin"
+    echo ""
+    echo "======================================================================"
+    echo " Already initialized to: $current_admin"
+    echo " No action taken. Exiting with code 0 (success)."
+    echo "======================================================================"
+    exit 0
+  else
+    # Admin is not set - contract needs initialization
+    echo "    Contract is not initialized. Proceeding with initialization..."
+    echo ""
+  fi
+}
+
+# Run pre-check for lending contract
+precheck_initialized "$LENDING_CONTRACT_ID" "$NETWORK"
+
+# ---------------------------------------------------------------------------
 # Pre-flight check
 # ---------------------------------------------------------------------------
 command -v stellar >/dev/null 2>&1 || {
@@ -154,13 +196,33 @@ echo "    Contract : $LENDING_CONTRACT_ID"
 echo "    Admin    : $ADMIN_ADDRESS"
 echo "    Function : initialize(admin)"
 
-stellar contract invoke \
+# Capture output and check for AlreadyInitialized error
+if ! output=$(stellar contract invoke \
   --id "$LENDING_CONTRACT_ID" \
   --source "$ADMIN_SECRET_KEY" \
   --network "$NETWORK" \
   "${RPC_ARGS[@]+"${RPC_ARGS[@]}"}" \
   -- initialize \
-  --admin "$ADMIN_ADDRESS"
+  --admin "$ADMIN_ADDRESS" 2>&1); then
+  # Check if the error is AlreadyInitialized (error code 13 or 1010)
+  if echo "$output" | grep -q "AlreadyInitialized\|error.*13\|error.*1010"; then
+    echo ""
+    echo "======================================================================"
+    echo " ERROR: Contract already initialized"
+    echo " The contract rejected the initialization attempt."
+    echo " Error: AlreadyInitialized (error code 13/1010)"
+    echo ""
+    echo " This indicates the contract was already initialized by a previous run."
+    echo " To verify the current admin, run:"
+    echo "   stellar contract invoke --id $LENDING_CONTRACT_ID --network $NETWORK -- get_admin"
+    echo "======================================================================"
+    exit 1
+  else
+    echo "    ERROR: Initialization failed with unexpected error."
+    echo "$output" >&2
+    exit 1
+  fi
+fi
 
 echo "    OK – lending contract initialized."
 

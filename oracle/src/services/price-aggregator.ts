@@ -126,6 +126,10 @@ export class PriceAggregator {
 
         for (const provider of this.providers) {
             try {
+                if (provider.isCooledDown) {
+                    logger.warn(`Skipping provider ${provider.name} due to active cooldown`);
+                    continue;
+                }
                 const rawPrice = await provider.fetchPrice(asset);
                 const validation = this.validator.validate(rawPrice);
 
