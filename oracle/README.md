@@ -251,3 +251,20 @@ $$delay = \text{jitter}(\min(\text{backoffCapMs}, \text{backoffBaseMs} \times 2^
 These default settings can be overridden in your workspace environment configuration layout:
 * `backoffBaseMs`: The initial delay seed multiplier (Default: `1000ms`).
 * `backoffCapMs`: The maximum delay timeout ceiling across all cumulative attempts (Default: `10000ms`).
+
+## Rate-Limit (429) Handling & Cooldown Semantics
+
+To prevent spamming external endpoints when rate limited, the oracle service implements robust **Retry-After** header parsing and active provider cooldowns.
+
+### Algorithm & Behavior
+
+When a price provider returns an HTTP `429 Too Many Requests` status:
+1. **Header Inspection**: The provider inspects the `Retry-After` header returned by the server.
+2. **Retry-After Parsing**:
+   - **Numeric duration (seconds)**: parsed as a non-negative integer and converted to milliseconds (e.g. `Retry-After: 30` -> 30,000ms cooldown).
+   - **HTTP-Date (GMT Date-String)**: parsed into a timestamp using standard date parsing (e.g. `Retry-After: Fri, 31 Dec 1999 23:59:59 GMT`), setting the cooldown to expire at that specific time.
+   - **Missing/Invalid Header**: Falls back to a standard **60-second** (60,000ms) cooldown to protect the API endpoint from immediate retries.
+3. **Suspension State**: The provider's internal state sets `cooldownUntil` to the calculated timestamp, rendering `isCooledDown` true.
+4. **Fetch Skipping**: While a cooldown is active, any direct calls to `fetchPrice` or `fetchPrices` on the provider are skipped and reject immediately without firing any HTTP requests.
+5. **Aggregator Fallback**: The `PriceAggregator` surfaces this cooldown, automatically skipping any cooled-down provider and immediately falling back to alternative healthy providers (e.g., Binance) to carry the price aggregation load seamlessly.
+
