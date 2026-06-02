@@ -59,7 +59,14 @@ impl VestingContract {
         }
     }
 
-    pub fn add_grant(&mut self, grantee: &str, total: u128, start_seconds: u64, duration_seconds: u64, cliff_seconds: u64) {
+    pub fn add_grant(
+        &mut self,
+        grantee: &str,
+        total: u128,
+        start_seconds: u64,
+        duration_seconds: u64,
+        cliff_seconds: u64,
+    ) {
         let g = Grant {
             grantee: grantee.to_string(),
             total,
@@ -109,7 +116,11 @@ impl VestingContract {
             return Err("already revoked".to_string());
         }
         let vested = g.vested_at(now);
-        let unvested = if g.total > vested { g.total - vested } else { 0 };
+        let unvested = if g.total > vested {
+            g.total - vested
+        } else {
+            0
+        };
         // reduce contract balance and send unvested to treasury
         let cbal = self.balances.entry("contract".to_string()).or_default();
         let transfer = if *cbal >= unvested { unvested } else { *cbal };
@@ -136,7 +147,7 @@ mod tests {
     fn claim_before_cliff_is_zero() {
         let mut c = VestingContract::new("admin", "treasury");
         c.add_grant("alice", 1000, 1000, 1000, 200); // start=1000, cliff=200
-        // time before cliff
+                                                     // time before cliff
         let claimed = c.claim("alice", 1100); // start+100 < start+cliff
         assert_eq!(claimed, 0);
         assert_eq!(c.balance_of("alice"), 0);
@@ -146,7 +157,7 @@ mod tests {
     fn claim_after_cliff_partial() {
         let mut c = VestingContract::new("admin", "treasury");
         c.add_grant("bob", 1000, 1000, 1000, 100); // cliff at 1100
-        // at time 1200, elapsed since start = 200, vested = 1000 * 200/1000 = 200
+                                                   // at time 1200, elapsed since start = 200, vested = 1000 * 200/1000 = 200
         let claimed = c.claim("bob", 1200);
         assert_eq!(claimed, 200);
         assert_eq!(c.balance_of("bob"), 200);

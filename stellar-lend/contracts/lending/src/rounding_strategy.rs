@@ -82,12 +82,8 @@ pub fn calculate_interest_with_rounding(
     let remainder = with_precision % denominator;
 
     // Step 5: Apply rounding strategy
-    let (rounded_interest, _actual_remainder) = apply_rounding(
-        full_division,
-        remainder,
-        denominator,
-        mode,
-    );
+    let (rounded_interest, _actual_remainder) =
+        apply_rounding(full_division, remainder, denominator, mode);
 
     // Step 6: Back-convert from precision scale
     let mut final_interest = rounded_interest / INTEREST_PRECISION;
@@ -97,7 +93,8 @@ pub fn calculate_interest_with_rounding(
     // due to subtle integer division edge-cases. Compute the floor-rounded
     // integer interest and clamp the ceil result to be >= floor.
     if mode == RoundingMode::Ceil {
-        let (floor_rounded, _) = apply_rounding(full_division, remainder, denominator, RoundingMode::Floor);
+        let (floor_rounded, _) =
+            apply_rounding(full_division, remainder, denominator, RoundingMode::Floor);
         let floor_interest = floor_rounded / INTEREST_PRECISION;
         if final_interest < floor_interest {
             final_interest = floor_interest;
@@ -159,7 +156,10 @@ pub fn reconcile_debt_with_drift_correction(
     }
 
     // Return reconciled debt and updated drift
-    Ok((freshly_calculated_debt, accumulated_drift + (freshly_calculated_debt - stored_debt)))
+    Ok((
+        freshly_calculated_debt,
+        accumulated_drift + (freshly_calculated_debt - stored_debt),
+    ))
 }
 
 #[cfg(test)]
@@ -168,7 +168,8 @@ mod tests {
 
     #[test]
     fn test_zero_borrowed_returns_zero_interest() {
-        let result = calculate_interest_with_rounding(0, 365 * 24 * 60 * 60, 500, RoundingMode::Floor);
+        let result =
+            calculate_interest_with_rounding(0, 365 * 24 * 60 * 60, 500, RoundingMode::Floor);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().interest, 0);
     }
@@ -181,7 +182,8 @@ mod tests {
             SECONDS_PER_YEAR,
             500, // 5%
             RoundingMode::Floor,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Expected: 100 * 0.05 = 5
         assert_eq!(result.interest, 5);
@@ -193,16 +195,14 @@ mod tests {
         let result_floor = calculate_interest_with_rounding(
             1000,
             SECONDS_PER_YEAR / 12, // 1 month
-            500, // 5% APR
+            500,                   // 5% APR
             RoundingMode::Floor,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let result_ceil = calculate_interest_with_rounding(
-            1000,
-            SECONDS_PER_YEAR / 12,
-            500,
-            RoundingMode::Ceil,
-        ).unwrap();
+        let result_ceil =
+            calculate_interest_with_rounding(1000, SECONDS_PER_YEAR / 12, 500, RoundingMode::Ceil)
+                .unwrap();
 
         // Ceil should round up from floor
         assert!(result_ceil.interest >= result_floor.interest);

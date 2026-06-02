@@ -34,11 +34,7 @@ mod interest_drift_regression_tests {
         let drift = (total_interest - expected).abs();
 
         // Banker's rounding should keep drift under 20 units for this scenario
-        assert!(
-            drift <= 20,
-            "Drift too large: {} (expected <= 20)",
-            drift
-        );
+        assert!(drift <= 20, "Drift too large: {} (expected <= 20)", drift);
     }
 
     /// ✅ Test: 100-month (8+ year) accrual with drift tracking
@@ -141,7 +137,12 @@ mod interest_drift_regression_tests {
         let accumulated_drift = 2i128;
         let max_allowed_drift_bps = 100; // 1% = 100 basis points
 
-        let _result = reconcile_debt_with_drift_correction(stored, fresh, accumulated_drift, max_allowed_drift_bps);
+        let _result = reconcile_debt_with_drift_correction(
+            stored,
+            fresh,
+            accumulated_drift,
+            max_allowed_drift_bps,
+        );
     }
 
     /// ✅ Test: Overflow handling on extreme horizons
