@@ -3,11 +3,12 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { PriceAggregator, createAggregator } from '../src/services/price-aggregator.js';
+import { PriceAggregator, createAggregator, filterOutliersByMAD } from '../src/services/price-aggregator.js';
 import { createValidator } from '../src/services/price-validator.js';
 import { createPriceCache } from '../src/services/cache.js';
 import { BasePriceProvider } from '../src/providers/base-provider.js';
-import type { RawPriceData, ProviderConfig, HealthStatus } from '../src/types/index.js';
+import { scalePrice } from '../src/config.js';
+import type { RawPriceData, PriceData, ProviderConfig, HealthStatus } from '../src/types/index.js';
 
 /**
  * Mock provider for testing
@@ -63,6 +64,121 @@ class MockProvider extends BasePriceProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helper: build a PriceData from a plain number (using PRICE_SCALE)
+// ---------------------------------------------------------------------------
+function pd(price: number, source = 'mock'): PriceData {
+    return {
+        asset: 'XLM',
+        price: scalePrice(price),
+        timestamp: Math.floor(Date.now() / 1000),
+        source,
+        confidence: 100,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// filterOutliersByMAD – unit tests
+// ---------------------------------------------------------------------------
+describe('filterOutliersByMAD', () => {
+    describe('edge cases – too few prices', () => {
+        it('returns single price unchanged', () => {
+            const prices = [pd(100)];
+            expect(filterOutliersByMAD(prices, 3.5)).toEqual(prices);
+        });
+
+        it('returns 2 prices unchanged (not enough data to reject)', () => {
+            const prices = [pd(100), pd(200)];
+            expect(filterOutliersByMAD(prices, 3.5)).toEqual(prices);
+        });
+    });
+
+    describe('filter disabled', () => {
+        it('returns all prices when zMax is 0', () => {
+            const prices = [pd(100), pd(101), pd(9999)];
+            expect(filterOutliersByMAD(prices, 0)).toEqual(prices);
+        });
+
+        it('returns all prices when zMax is negative', () => {
+            const prices = [pd(100), pd(101), pd(9999)];
+            expect(filterOutliersByMAD(prices, -1)).toEqual(prices);
+        });
+    });
+
+    describe('3 sources', () => {
+        it('keeps all prices when none are outliers', () => {
+            const prices = [pd(100), pd(101), pd(102)];
+            const result = filterOutliersByMAD(prices, 3.5);
+            expect(result).toHaveLength(3);
+        });
+
+        it('removes a clear outlier (10× the cluster)', () => {
+            const prices = [pd(100), pd(101), pd(1000)];
+            const result = filterOutliersByMAD(prices, 3.5);
+            expect(result).toHaveLength(2);
+            expect(result.every((p) => p.price < scalePrice(200))).toBe(true);
+        });
+
+        it('keeps all prices when MAD is 0 (all identical)', () => {
+            const prices = [pd(100), pd(100), pd(100)];
+            expect(filterOutliersByMAD(prices, 3.5)).toHaveLength(3);
+        });
+    });
+
+    describe('5 sources', () => {
+        it('keeps all 5 prices when cluster is tight', () => {
+            const prices = [pd(100), pd(100.5), pd(101), pd(100.2), pd(99.8)];
+            const result = filterOutliersByMAD(prices, 3.5);
+            expect(result).toHaveLength(5);
+        });
+
+        it('removes a single high outlier from 5 sources', () => {
+            const prices = [pd(100), pd(100.5), pd(101), pd(100.2), pd(5000)];
+            const result = filterOutliersByMAD(prices, 3.5);
+            expect(result).toHaveLength(4);
+            expect(result.some((p) => p.price === scalePrice(5000))).toBe(false);
+        });
+
+        it('removes a single low outlier from 5 sources', () => {
+            const prices = [pd(100), pd(100.5), pd(101), pd(100.2), pd(0.001)];
+            const result = filterOutliersByMAD(prices, 3.5);
+            expect(result).toHaveLength(4);
+            expect(result.some((p) => p.price === scalePrice(0.001))).toBe(false);
+        });
+
+        it('removes both high and low outliers when 2 rogue feeds drift far', () => {
+            // Two adversarial feeds; 3 honest prices cluster at ~100
+            const prices = [pd(100), pd(100.5), pd(101), pd(5000), pd(0.001)];
+            const result = filterOutliersByMAD(prices, 3.5);
+            // At most the honest cluster survives
+            expect(result.length).toBeLessThanOrEqual(3);
+            const allNearCluster = result.every(
+                (p) => p.price >= scalePrice(99) && p.price <= scalePrice(102)
+            );
+            expect(allNearCluster).toBe(true);
+        });
+    });
+
+    describe('threshold sensitivity', () => {
+        it('tighter threshold (z=1) removes more prices', () => {
+            // 3 prices with moderate spread
+            const prices = [pd(100), pd(110), pd(120)];
+            const strict = filterOutliersByMAD(prices, 1.0);
+            const lenient = filterOutliersByMAD(prices, 3.5);
+            expect(strict.length).toBeLessThanOrEqual(lenient.length);
+        });
+
+        it('very large threshold keeps all prices', () => {
+            const prices = [pd(100), pd(101), pd(1000)];
+            const result = filterOutliersByMAD(prices, 1000);
+            expect(result).toHaveLength(3);
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// PriceAggregator integration – MAD wired in
+// ---------------------------------------------------------------------------
 describe('PriceAggregator', () => {
     let aggregator: PriceAggregator;
     let mockProvider1: MockProvider;
@@ -70,7 +186,6 @@ describe('PriceAggregator', () => {
     let mockProvider3: MockProvider;
 
     beforeEach(() => {
-        // Create mock providers with different prices
         mockProvider1 = new MockProvider('provider1', 1, 0.5, {
             XLM: 0.15,
             BTC: 50000,
@@ -90,7 +205,7 @@ describe('PriceAggregator', () => {
         });
 
         const validator = createValidator({
-            maxDeviationPercent: 20, // Higher threshold for test variation
+            maxDeviationPercent: 20,
             maxStalenessSeconds: 300,
         });
 
@@ -146,6 +261,38 @@ describe('PriceAggregator', () => {
             expect(result).not.toBeNull();
             expect(result?.sources.every(s => s.source !== 'provider1')).toBe(true);
         });
+
+        it('should still produce a result when MAD filter would drop too many sources (fallback)', async () => {
+            // Very tight threshold forces fallback to unfiltered list
+            const tightAggregator = createAggregator(
+                [mockProvider1, mockProvider2, mockProvider3],
+                createValidator({ maxDeviationPercent: 20, maxStalenessSeconds: 300 }),
+                createPriceCache(30),
+                { minSources: 1, madZScoreThreshold: 0.0001 }
+            );
+
+            const result = await tightAggregator.getPrice('XLM');
+            expect(result).not.toBeNull();
+        });
+
+        it('rejects a severely drifted provider price and uses the cluster', async () => {
+            // Inject an adversarial outlier into provider3
+            mockProvider3.setPrice('XLM', 999.0); // wildly far from 0.15
+
+            const outliersAggregator = createAggregator(
+                [mockProvider1, mockProvider2, mockProvider3],
+                createValidator({ maxDeviationPercent: 100_000, maxStalenessSeconds: 300 }),
+                createPriceCache(30),
+                { minSources: 1, madZScoreThreshold: 3.5 }
+            );
+
+            const result = await outliersAggregator.getPrice('XLM');
+            expect(result).not.toBeNull();
+            // Price should be close to the honest cluster (~0.15), not skewed toward 999
+            const price = Number(result!.price) / 1_000_000;
+            expect(price).toBeGreaterThan(0.1);
+            expect(price).toBeLessThan(1.0);
+        });
     });
 
     describe('getPrices', () => {
@@ -159,7 +306,6 @@ describe('PriceAggregator', () => {
         });
 
         it('should skip assets that fail', async () => {
-            // SOL not in any mock provider
             const results = await aggregator.getPrices(['XLM', 'SOL']);
 
             expect(results.size).toBe(1);

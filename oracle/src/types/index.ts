@@ -114,6 +114,7 @@ export interface OracleServiceConfig {
     adminSecretKey: string;
     updateIntervalMs: number;
     maxPriceDeviationPercent: number;
+    madZScoreThreshold: number;
     priceStaleThresholdSeconds: number;
     cacheTtlSeconds: number;
     redisUrl?: string;
