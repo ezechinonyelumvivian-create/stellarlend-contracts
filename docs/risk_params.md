@@ -19,6 +19,7 @@ This document provides a consolidated view of all protocol risk parameters, incl
 | Borrow Cap | Maximum total borrow allowed for a specific asset | Defined in code | ≥ 0 | Admin-controlled setter | Prevents excessive leverage and liquidity stress |
 | Minimum Borrow | Minimum borrowable amount | Defined in code | ≥ 0 | Admin-controlled setter | Avoids inefficient micro-loans and reduces spam |
 | Rate Limits | Constraints on how quickly parameters or balances can change | Defined in code | Protocol-defined bounds | Admin-controlled setter | Prevents sudden parameter manipulation and extreme volatility |
+| Minimum Collateral Ratio | Required collateral to debt ratio to prevent withdrawals or new borrows (10000 = 1.0) | 10000 | ≥ 10000 | Constant (code) | Prevents protocol insolvency by ensuring all debt is backed by collateral |
 
 ### Collateral-Ratio Formula
 
@@ -64,7 +65,9 @@ where `col_ratio` is stored under the `"col_ratio"` instance-storage key (defaul
 - Validation is applied through:
   - Constant definitions
   - Admin setter functions
-  - Checked arithmetic in core operations
+- Withdraw operations are also constrained by the same minimum collateral
+  ratio invariant (`MIN_COLLATERAL_RATIO_BPS`): post-withdraw collateral must remain sufficient to back
+  outstanding debt (including accrued interest).
 - Any parameter updates must pass bounds checks before being applied.
 
 

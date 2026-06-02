@@ -14,8 +14,8 @@ All keys are defined using `contracttype` enums.
 
 To keep user positions readable, the lending contract now extends the TTL for the two position-specific persistent entries:
 
-- `("col", user)` — collateral balance
-- `("debt", user)` — debt position record
+- `DataKey::Collateral(user)` — collateral balance
+- `DataKey::Debt(user)` — debt position record
 
 The policy is:
 
@@ -166,7 +166,8 @@ If a storage layout change is unavoidable (e.g., merging two maps into one), fol
 
 ## Security Assumptions and Validation
 
-- **No Overwrites**: Storage keys are designed to be unique. Map-based keys use composite structures like `UserAssetKey(Address, AssetKey)` to prevent users from affecting each other's data.
+- **No Overwrites**: Storage keys are designed to be unique. Using `contracttype` enums for keys ensures that different data types even with the same payload (like `Collateral(Address)` vs `Debt(Address)`) serialize to distinct storage slots.
+- **Multi-Address Isolation**: By including the user `Address` in the `DataKey` variant payload (e.g., `DataKey::Collateral(Address)`), we guarantee that one user's operations can never affect another's balance. This is verified by multi-user suite tests in `lib.rs`.
 - **Persistent Only**: All critical protocol state is stored in `persistent()` storage to prevent expiration (subject to rent payments).
 - **Admin Isolation**: Admin addresses are stored in module-specific keys, allowing for granular permission management or a unified global admin.
 
