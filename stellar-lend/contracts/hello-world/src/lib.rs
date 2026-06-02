@@ -1,6 +1,12 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HelloError {
+    InvalidAmount = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -32,6 +38,9 @@ impl HelloContract {
 
     /// Increment the user's deposit balance.
     pub fn deposit(env: Env, user: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(env, HelloError::InvalidAmount);
+        }
         user.require_auth();
         let key = ("bal", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -42,6 +51,9 @@ impl HelloContract {
 
     /// Decrement the user's deposit balance.
     pub fn withdraw(env: Env, user: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(env, HelloError::InvalidAmount);
+        }
         user.require_auth();
         let key = ("bal", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -52,6 +64,9 @@ impl HelloContract {
 
     /// Borrow increases the user's debt.
     pub fn borrow(env: Env, user: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(env, HelloError::InvalidAmount);
+        }
         user.require_auth();
         let key = ("debt", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -62,6 +77,9 @@ impl HelloContract {
 
     /// Repay decreases the user's debt.
     pub fn repay(env: Env, user: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(env, HelloError::InvalidAmount);
+        }
         user.require_auth();
         let key = ("debt", user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -147,5 +165,77 @@ mod test {
         let s = client.get_state(&user);
         assert_eq!(s.balance, 500);
         assert_eq!(s.debt, 100);
+    }
+
+    #[test]
+    fn test_deposit_rejects_zero_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.deposit(&user, &0);
+        }));
+        assert!(result.is_err(), "deposit should panic with zero amount");
+    }
+
+    #[test]
+    fn test_deposit_rejects_negative_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.deposit(&user, &-100);
+        }));
+        assert!(result.is_err(), "deposit should panic with negative amount");
+    }
+
+    #[test]
+    fn test_withdraw_rejects_zero_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.withdraw(&user, &0);
+        }));
+        assert!(result.is_err(), "withdraw should panic with zero amount");
+    }
+
+    #[test]
+    fn test_withdraw_rejects_negative_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.withdraw(&user, &-100);
+        }));
+        assert!(result.is_err(), "withdraw should panic with negative amount");
+    }
+
+    #[test]
+    fn test_borrow_rejects_zero_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.borrow(&user, &0);
+        }));
+        assert!(result.is_err(), "borrow should panic with zero amount");
+    }
+
+    #[test]
+    fn test_borrow_rejects_negative_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.borrow(&user, &-100);
+        }));
+        assert!(result.is_err(), "borrow should panic with negative amount");
+    }
+
+    #[test]
+    fn test_repay_rejects_zero_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.repay(&user, &0);
+        }));
+        assert!(result.is_err(), "repay should panic with zero amount");
+    }
+
+    #[test]
+    fn test_repay_rejects_negative_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.repay(&user, &-100);
+        }));
+        assert!(result.is_err(), "repay should panic with negative amount");
     }
 }
