@@ -42,6 +42,14 @@ Covers protocol-level parameters such as collateral ratios, liquidation threshol
 Provides step-by-step instructions for building, deploying, and initializing contracts on testnet and mainnet.
 
 
+### Interface & API
+
+- [Interface Quick Reference](interface_quick_reference.md)
+- [Lending Contract README](../stellar-lend/contracts/lending/README.md)
+
+Documents the **shipping** function surface of the lending contract (`src/lib.rs`), including exact signatures, return types, error codes, and emergency state permissions. Functions that are planned but not yet implemented are explicitly marked as 🔮 Planned.
+
+
 ## Additional Documentation
 
 - Threat models and extended security analysis (if present)

@@ -1,90 +1,162 @@
 # Contract Interface Quick Reference
 
-This document provides a single source of truth for frontend integrators
-interacting with the StellarLend smart contracts.
+> **Sync note**: This file must stay in sync with
+> `stellar-lend/contracts/lending/src/lib.rs`. After any `pub fn` change in
+> that file, update the tables below and run
+> `bash docs/scripts/check_interface_sync.sh` to verify.
 
 ---
 
 ## 1. Unit Scales & Precisions
 
 | Parameter | Scale | Description |
+|-----------|-------|-------------|
+| Amounts | raw `i128` | No automatic decimal shifting. Callers supply and receive raw integer amounts. |
+| Health Factor | 10^4 base | `1.0 = 10000`. Values `< 10000` are eligible for liquidation. `1_000_000` is the sentinel for a debt-free position. |
+| Basis Points (BPS) | 10^4 | `1% = 100 BPS`. Used for interest rates, fees, and risk thresholds. |
+| Timestamps | Seconds | Unix epoch seconds from `env.ledger().timestamp()`. |
+
+---
+
+## 2. Implemented Function Reference
+
+### Initialization
+
+| Function | Signature | Auth Required | Returns |
+|---|---|---|---|
+| `initialize` | `(admin: Address)` | — | `()` |
+| `get_admin` | `()` | — | `Address` |
+| `propose_admin` | `(new_admin: Address)` | current admin | `()` |
+| `accept_admin` | `()` | proposed admin | `()` |
+
+### User Operations
+
+| Function | Signature | Auth Required | Returns |
+|---|---|---|---|
+| `deposit` | `(user: Address, amount: i128)` | `user` | `i128` — new collateral balance |
+| `withdraw` | `(user: Address, amount: i128)` | `user` | `i128` — new collateral balance |
+| `borrow` | `(user: Address, amount: i128)` | `user` | `Result<i128, LendingError>` — debt principal |
+| `repay` | `(user: Address, amount: i128)` | `user` | `i128` — remaining debt principal |
+| `liquidate` | `(liquidator: Address, borrower: Address, amount: i128)` | `liquidator` | `Result<i128, Error>` — debt actually repaid |
+
+### Flash Loans
+
+| Function | Signature | Auth Required | Returns |
+|---|---|---|---|
+| `flash_loan` | `(receiver: Address, asset: Address, amount: i128, params: Bytes)` | `receiver` | `()` |
+| `repay_flash_loan` | `(asset: Address, amount: i128)` | invoker (receiver contract) | `()` |
+
+### View Functions
+
+| Function | Signature | Returns |
 |---|---|---|
-| Amounts | 10^7 | All asset amounts (XLM, USDC, etc.) use 7 decimal places. |
-| Health Factor | 10^4 | 1.0 = 10000. Values < 10000 are subject to liquidation. |
-| BPS (Basis Points) | 10^4 | 1% = 100 BPS. Used for interest rates and fees. |
-| Timestamps | Seconds | Unix epoch timestamps. |
+| `get_position` | `(user: Address)` | `PositionSummary { collateral: i128, debt: i128, health_factor: i128 }` |
+| `get_debt_position` | `(user: Address)` | `DebtPosition { principal: i128, last_accrual: u64 }` |
+| `get_min_borrow` | `()` | `i128` |
+
+### Admin & Risk Controls
+
+| Function | Signature | Auth Required | Returns |
+|---|---|---|---|
+| `set_min_borrow` | `(min_borrow: i128)` | admin | `Result<(), LendingError>` |
+| `set_debt_ceiling` | `(ceiling: i128)` | admin | `Result<(), LendingError>` |
+| `set_emergency_state` | `(new_state: EmergencyState)` | admin or guardian | `()` |
 
 ---
 
-## 2. Core View Functions
+## 3. Return Types
 
-### `get_position(user: Address) -> PositionSummary`
-Returns `{ collateral, debt, health_factor }` for the user.  
-**Use case:** Dashboard health check, borrow eligibility.
+### `PositionSummary`
 
-### `get_debt_position(user: Address) -> DebtPosition`
-Returns raw `{ principal, last_update }` for the user's debt entry.  
-**Use case:** Interest accrual calculations, repay amount estimation.
+```rust
+pub struct PositionSummary {
+    pub collateral: i128,    // Raw collateral balance
+    pub debt: i128,          // Effective debt (principal + accrued interest)
+    pub health_factor: i128, // (collateral * 8000) / debt; 1_000_000 if debt == 0
+}
+```
 
-### `get_min_borrow() -> i128`
-Returns the minimum borrow amount set by the admin (0 if unset).
+### `DebtPosition`
 
-### `get_admin() -> Result<Address, LendingError>`
-Returns the admin address. Returns `LendingError::NotInitialized` if the
-contract has not yet been initialized — use `try_get_admin()` on the client
-and handle the error explicitly.
+```rust
+pub struct DebtPosition {
+    pub principal: i128,    // Borrowed principal (before interest)
+    pub last_accrual: u64,  // Timestamp of last interest calculation
+}
+```
+
+### `EmergencyState`
+
+```rust
+pub enum EmergencyState {
+    Normal,    // All operations permitted
+    Shutdown,  // All operations blocked
+    Recovery,  // Only repay and withdraw permitted
+}
+```
 
 ---
 
-## 3. Admin Entrypoints (all require admin auth)
+## 4. Error Codes
 
-| Entrypoint | Returns | Notes |
+| Code | Variant | Meaning | Suggested UI Message |
+|------|---------|---------|----------------------|
+| 1008 | `LendingError::BelowMinimumBorrow` | Borrow amount below protocol minimum | "Amount is below the minimum borrow. Please increase your amount." |
+| 1009 | `LendingError::NotInitialized` | Contract not yet initialized | "Contract is not ready. Contact the administrator." |
+| 1010 | `LendingError::AlreadyInitialized` | `initialize` called twice | "Contract already initialized." |
+| 2001 | `LendingError::DebtCeilingExceeded` | Borrow would exceed global debt ceiling | "Protocol debt limit reached. Try a smaller amount." |
+| 2002 | `LendingError::DepositCapExceeded` | Deposit would exceed total cap | "Deposit cap reached. Try a smaller amount." |
+| 2003 | `LendingError::Overflow` | Checked arithmetic would overflow | "Arithmetic error. Amount may be too large." |
+| 2004 | `Error::PositionHealthy` | Liquidation rejected — position is healthy | "This position cannot be liquidated." |
+
+---
+
+## 5. Emergency State Permissions
+
+| State | Deposit | Borrow | Repay | Withdraw | Liquidate |
+|---|---|---|---|---|---|
+| `Normal` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Shutdown` | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `Recovery` | ❌ | ❌ | ✅ | ✅ | ❌ |
+
+---
+
+## 6. Events Emitted
+
+| Event Topic | Payload | Emitted When |
 |---|---|---|
-| `initialize(admin)` | `Result<(), LendingError>` | Single-call only. Rejects with `AlreadyInitialized` after first call. |
-| `propose_admin(new_admin)` | `Result<(), LendingError>` | Begins two-step rotation. |
-| `accept_admin()` | `Result<(), LendingError>` | Pending admin signs to complete. |
-| `set_min_borrow(amount)` | `Result<(), LendingError>` | Sets minimum borrow floor. |
-| `set_debt_ceiling(ceiling)` | `Result<(), LendingError>` | Protocol-level borrow cap. |
-| `set_flash_fee(fee_bps)` | `Result<(), LendingError>` | Must be in `[0, 1000]`. |
-| `set_guardian(guardian)` | `Result<(), LendingError>` | Grants emergency pause rights. |
-| `set_emergency_state(state)` | `Result<(), LendingError>` | Admin **or** guardian. |
+| `EmergencyStateChanged` | `(old_state: EmergencyState, new_state: EmergencyState)` | `set_emergency_state` completes |
+
+> Additional events for `deposit`, `borrow`, `repay`, `liquidate`, and `flash_loan` are **planned** but not yet emitted by the current implementation.
 
 ---
 
-## 4. Error Mapping Guidance
+## 7. 🔮 Planned — Not Yet Implemented
 
-| Error code | Name | Suggested UI message |
-|---|---|---|
-| 1008 | `BelowMinimumBorrow` | "Amount is too small. Minimum borrow required." |
-| 1009 | `NotInitialized` | "Contract not ready. Contact support." |
-| 1010 | `AlreadyInitialized` | (internal — should never reach UI) |
-| 2001 | `DebtCeilingExceeded` | "Protocol borrow limit reached. Try a smaller amount." |
-| 2002 | `DepositCapExceeded` | "Deposit limit reached. Try a smaller amount." |
-| 2003 | `Overflow` | "Amount too large. Please enter a smaller value." |
-| 2004 | `Unauthorized` | "You are not authorised to perform this action." |
-| 2005 | `InvalidFeeBps` | "Fee must be between 0 and 10%." |
-| 2006 | `PositionHealthy` | "This position cannot be liquidated yet." |
+The following functions and events are **not** present in `src/lib.rs` and should not be called. They are documented here for roadmap visibility.
 
----
-
-## 5. Events to Subscribe
-
-| Event | Emitted when |
+| Function / Event | Tracking |
 |---|---|
-| `EmergencyStateChanged` | Emergency state transitions |
+| `get_health_factor(user)` | Planned — today embedded in `get_position` |
+| `get_emergency_state()` | Planned public view (state visible via events today) |
+| `set_guardian(admin, guardian)` | Planned setter for guardian role |
+| `set_oracle(admin, oracle)` | Planned — required for multi-asset health factor |
+| `set_liquidation_threshold_bps(admin, bps)` | Planned — currently hardcoded 8000 BPS |
+| `set_close_factor_bps(admin, bps)` | Planned — currently hardcoded 5000 BPS |
+| `set_pause(admin, pause_type, paused)` | Planned granular per-operation pause |
+| `get_collateral_value(user)` | Planned — requires oracle |
+| `get_debt_value(user)` | Planned — requires oracle |
+| `get_max_liquidatable_amount(user)` | Planned convenience helper |
+| `upgrade_*` functions | Planned multisig upgrade governance |
+| `data_*` functions | Planned persistent data-store management |
+| `BorrowEvent`, `RepayEvent`, `LiquidationEvent` | Planned contract events |
 
 ---
 
-## 6. Integration Checklist
+## 8. Integration Checklist
 
-- [ ] Call `try_initialize` and handle `AlreadyInitialized` gracefully on
-  re-deploys.
-- [ ] Use `try_get_admin()` instead of `get_admin()` before the contract is
-  guaranteed to be initialized.
-- [ ] Convert UI inputs to 10^7 scale before sending to contract.
-- [ ] Check `health_factor` from `get_position` before allowing further
-  borrows (liquidation threshold is 10000).
-- [ ] Verify `user.require_auth()` is handled by the wallet connector for
-  all user operations (deposit, withdraw, borrow, repay).
-- [ ] Admin operations require the admin key to sign — never expose the admin
-  private key in a browser context.
+- [ ] Use raw `i128` for all amounts — no automatic decimal conversion.
+- [ ] Call `get_position(user)` before allowing further borrows; check `health_factor >= 10000`.
+- [ ] Ensure wallet connector handles `user.require_auth()` for all user-facing calls.
+- [ ] Confirm `EmergencyState::Normal` before presenting deposit / borrow UI to users.
+- [ ] Flash loan receivers must implement an `on_flash_loan(initiator, asset, amount, fee, params)` endpoint.
