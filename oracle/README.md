@@ -139,3 +139,16 @@ oracle/
 ```
 
 ## Cheers!
+
+## Network Resiliency & Backoff Strategy
+
+To mitigate thundering-herd issues during transient Soroban RPC node congestion, the oracle instance employs an **Linear/Exponential Backoff with Full Jitter** strategy on transaction retries.
+
+Instead of a fixed interval, the wait time before any retry sequence is evaluated dynamically using the following equation:
+
+$$delay = \text{jitter}(\min(\text{backoffCapMs}, \text{backoffBaseMs} \times 2^{\text{attempt}}))$$
+
+### Config Knobs
+These default settings can be overridden in your workspace environment configuration layout:
+* `backoffBaseMs`: The initial delay seed multiplier (Default: `1000ms`).
+* `backoffCapMs`: The maximum delay timeout ceiling across all cumulative attempts (Default: `10000ms`).
