@@ -49,33 +49,46 @@ The table below reflects the **shipping** surface of `src/lib.rs` as of this bra
 | `get_admin` | `(env) → Address` | — | Returns the current admin address. |
 | `propose_admin` | `(env, new_admin: Address)` | current admin | Step 1 of two-step admin transfer. Stores the proposed address. |
 | `accept_admin` | `(env)` | proposed admin | Step 2: accepts the role committed by `propose_admin`. |
+| `set_guardian` | `(env, guardian: Address)` | admin | Stores the guardian address allowed to enter `Shutdown`. |
+| `get_guardian` | `(env) → Option<Address>` | — | Returns the configured guardian address, if any. |
 
 ### User Operations
 
 | Function | Signature | Auth | Returns | Description |
 |---|---|---|---|---|
-| `deposit` | `(env, user: Address, amount: i128) → i128` | `user` | New collateral balance | Adds `amount` to the user's collateral. Enforces deposit cap. Blocked during Shutdown. |
-| `withdraw` | `(env, user: Address, amount: i128) → i128` | `user` | New collateral balance | Removes `amount` from the user's collateral. Only allowed in Normal and Recovery states. |
+| `deposit` | `(env, user: Address, amount: i128) → Result<i128, LendingError>` | `user` | New collateral balance | Adds `amount` to the user's collateral. Enforces deposit cap. Blocked during Shutdown. |
+| `withdraw` | `(env, user: Address, amount: i128) → Result<i128, LendingError>` | `user` | New collateral balance | Removes `amount` from the user's collateral. Only allowed in Normal and Recovery states. |
 | `borrow` | `(env, user: Address, amount: i128) → Result<i128, LendingError>` | `user` | Updated debt principal | Increases user debt; enforces `min_borrow` and protocol debt ceiling. Blocked during Shutdown/Recovery. |
-| `repay` | `(env, user: Address, amount: i128) → i128` | `user` | Remaining debt principal | Reduces user debt with interest accrued up to the current timestamp. Allowed in Normal and Recovery. |
-| `liquidate` | `(env, liquidator: Address, borrower: Address, amount: i128) → Result<i128, Error>` | `liquidator` | Actual debt repaid | Repays up to 50% of an undercollateralized borrower's debt and seizes proportional collateral (+ 10% bonus). Reverts if position is healthy (`hf >= 10000`). |
+| `repay` | `(env, user: Address, amount: i128) → Result<i128, LendingError>` | `user` | Remaining debt principal | Reduces user debt with interest accrued up to the current timestamp. Allowed in Normal and Recovery. |
+| `liquidate` | `(env, liquidator: Address, borrower: Address, amount: i128) → Result<i128, LendingError>` | `liquidator` | Actual debt repaid | Repays up to 50% of an undercollateralized borrower's debt and seizes proportional collateral (+ 10% bonus). Reverts if position is healthy (`hf >= 10000`). |
 
 ### Flash Loans
 
 | Function | Signature | Auth | Description |
 |---|---|---|---|
-| `flash_loan` | `(env, receiver: Address, asset: Address, amount: i128, params: Bytes)` | `receiver` | Transfers `amount` to `receiver`, calls `on_flash_loan(initiator, asset, amount, fee, params)`, then verifies full repayment including fee. |
-| `repay_flash_loan` | `(env, asset: Address, amount: i128)` | invoker | Called **by the receiver contract** inside the `on_flash_loan` callback to return principal + fee. |
+| `flash_loan` | `(env, initiator: Address, receiver: Address, asset: Address, amount: i128, params: Bytes)` | `initiator` | Transfers `amount` to `receiver`, calls `on_flash_loan(initiator, asset, amount, fee, params)`, then verifies full repayment including fee. |
+| `repay_flash_loan` | `(env, payer: Address, asset: Address, amount: i128)` | `payer` | Called by the receiver flow to move principal + fee from `payer` back to treasury storage. |
 
-> **Flash loan fee**: controlled by `DataKey::FlashFeeBps` (default 5 bps = 0.05%). Currently settable only by direct storage mutation; a public setter is planned.
+> **Flash loan fee**: controlled by `DataKey::FlashFeeBps` (default 5 bps = 0.05%) and set through `set_flash_fee`.
 
 ### View Functions
 
 | Function | Signature | Returns | Description |
 |---|---|---|---|
-| `get_position` | `(env, user: Address) → PositionSummary` | `{ collateral: i128, debt: i128, health_factor: i128 }` | Returns collateral balance, effective debt (principal + accrued interest), and health factor (`col * 8000 / debt`; `1_000_000` when debt is zero). Extends TTL on read. |
-| `get_debt_position` | `(env, user: Address) → DebtPosition` | `{ principal: i128, last_accrual: u64 }` | Raw debt state; useful for debugging or off-chain interest simulation. Extends TTL on read. |
+| `get_position` | `(env, user: Address) → PositionSummary` | `{ collateral: i128, debt: i128, health_factor: i128 }` | Returns collateral balance, effective debt (principal + accrued interest), and health factor (`col * 8000 / debt`; `100_000_000` when debt is zero). Extends TTL on read. |
+| `get_debt_position` | `(env, user: Address) → DebtPosition` | `{ principal: i128, last_update: u64 }` | Raw debt state; useful for debugging or off-chain interest simulation. Extends TTL on read. |
 | `get_min_borrow` | `(env) → i128` | `i128` | Returns the current minimum borrow amount (default `0`). |
+| `get_health_factor` | `(env, user: Address) → i128` | `i128` | Convenience health-factor view using the same liquidation threshold scale; returns the no-debt sentinel when debt is zero. |
+| `get_protocol_metrics` | `(env) → ProtocolMetrics` | `{ total_borrow: i128, total_supply: i128, utilization_bps: i128, ledger: u32 }` | Returns aggregate borrow/supply utilization and the current ledger sequence. |
+
+### Oracle Price Controls
+
+| Function | Signature | Auth | Description |
+|---|---|---|---|
+| `set_oracle_pubkey` | `(env, pubkey: BytesN<32>)` | admin | Stores the Ed25519 public key used to verify signed price updates. |
+| `get_oracle_pubkey` | `(env) → Option<BytesN<32>>` | — | Returns the configured oracle public key, if any. |
+| `set_price` | `(env, caller: Address, asset: Address, price: i128, timestamp: u64, signature: BytesN<64>) → Result<(), LendingError>` | `caller` must be admin | Verifies a signed price payload and stores a fresh `PriceRecord` for `asset`. |
+| `get_price_record` | `(env, asset: Address) → Option<PriceRecord>` | — | Returns the stored oracle price and timestamp for `asset`, if present. |
 
 ### Admin & Risk Controls
 
@@ -83,6 +96,7 @@ The table below reflects the **shipping** surface of `src/lib.rs` as of this bra
 |---|---|---|---|
 | `set_min_borrow` | `(env, min_borrow: i128) → Result<(), LendingError>` | admin | Sets the minimum amount required to open or increase a borrow. |
 | `set_debt_ceiling` | `(env, ceiling: i128) → Result<(), LendingError>` | admin | Sets the maximum total protocol debt. |
+| `set_flash_fee` | `(env, fee_bps: i128) → Result<(), LendingError>` | admin | Sets the flash-loan fee in the inclusive range `[0, 1000]` bps. |
 | `set_emergency_state` | `(env, new_state: EmergencyState)` | admin or guardian | Transitions between `Normal`, `Shutdown`, and `Recovery`. Emits `EmergencyStateChanged` event. |
 
 ### Emergency State Machine
@@ -111,6 +125,7 @@ Normal ──► Shutdown ──► Recovery ──► Normal
 | `LendingError::DebtCeilingExceeded` | 2001 | Borrow would exceed the global debt ceiling. |
 | `LendingError::DepositCapExceeded` | 2002 | Deposit would exceed the total deposit cap. |
 | `LendingError::InvalidFeeBps` | 2005 | Flash loan fee is outside the permitted range. |
+| `LendingError::InsufficientCollateral` | 2007 | Collateral is too low for the requested operation. |
 | `LendingError::InvalidOracleSignature` | 5001 | Oracle price update signature is invalid. |
 | `LendingError::StaleOracleTimestamp` | 5002 | Oracle price update is too old. |
 | `LendingError::OraclePubkeyNotSet` | 5003 | Oracle public key is missing from storage. |
@@ -123,12 +138,10 @@ The functions listed below appear in older documentation but are **not yet imple
 
 | Function | Notes |
 |---|---|
-| `set_oracle(env, admin, oracle)` | Price feed integration required for multi-asset health factor. |
+| `set_oracle(env, admin, oracle)` | External oracle contract adapter; signed `set_oracle_pubkey` / `set_price` flow is implemented today. |
 | `set_pause(env, admin, pause_type, paused)` | Granular per-operation pausing (currently only global via `set_emergency_state`). |
-| `set_guardian(env, admin, guardian)` | Dedicated setter for the guardian role (currently set directly in storage). |
 | `set_liquidation_threshold_bps(env, admin, bps)` | Configurable liquidation threshold (currently hardcoded at 8000 BPS). |
 | `set_close_factor_bps(env, admin, bps)` | Configurable close factor (currently hardcoded at 5000 BPS). |
-| `get_health_factor(env, user)` | Convenience view (health factor is embedded in `get_position` today). |
 | `get_collateral_value(env, user)` | USD-denominated collateral value (requires oracle). |
 | `get_debt_value(env, user)` | USD-denominated debt value (requires oracle). |
 | `get_max_liquidatable_amount(env, user)` | Convenience helper for liquidators. |
