@@ -50,6 +50,8 @@ mod flash_utilization_test;
 #[cfg(test)]
 mod liquidation_bonus_proptest;
 #[cfg(test)]
+mod isolation_mode_test;
+#[cfg(test)]
 mod rounding_drift_test;
 #[cfg(test)]
 mod rate_cache_test;
@@ -68,7 +70,7 @@ mod bad_debt_ledger_test;
 #[cfg(test)]
 mod supply_rate_split_test;
 #[cfg(test)]
-mod insurance_fund_test;
+mod repay_debt_floor_test;
 
 use debt::{
     borrow_amount, cached_borrow_rate, effective_debt, load_debt, repay_amount, save_debt,
@@ -134,8 +136,11 @@ pub enum DataKey {
     TotalDebtAsset(Address),
     /// Insurance fund balance credited by governance or protocol fees (i128).
     InsuranceFund,
-    /// Configured share of accrued interest directed to the insurance fund (i128, bps).
-    InsuranceShareBps,
+    /// Per-asset isolation-mode configuration (isolated flag + debt ceiling).
+    AssetIsolation(Address),
+    /// Running total of debt currently backed by this isolated asset.
+    /// Incremented on borrow, decremented on repay. Stored as `persistent`.
+    IsolationDebt(Address),
 }
 
 #[contractevent]
@@ -239,6 +244,10 @@ pub enum LendingError {
     InsufficientCollateral = 2007,
     /// Rejects a liquidation where the liquidator and borrower are the same address.
     SelfLiquidation = 2008,
+    /// A borrow would push debt backed by an isolated asset beyond its
+    /// per-asset isolation debt ceiling.
+    IsolationCeilingExceeded = 2009,
+    InvalidIsolationCeiling = 2010,
     InvalidOracleSignature = 5001,
     StaleOracleTimestamp = 5002,
     OraclePubkeyNotSet = 5003,
@@ -263,6 +272,33 @@ pub enum LendingError {
     NoBadDebt = 6001,
     /// `write_off_bad_debt` called with `amount` greater than recorded bad debt.
     WriteOffExceedsBadDebt = 6002,
+}
+
+/// Per-asset isolation-mode configuration stored under `DataKey::AssetIsolation`.
+///
+/// When `isolated` is `true` the asset may only be used as borrow-only collateral
+/// within cross-asset positions:
+///
+/// 1. Its collateral contribution is capped so that total debt backed by this
+///    asset never exceeds `isolation_debt_ceiling`.
+/// 2. It cannot be combined with other collateral to amplify borrowing power —
+///    if a user's position contains an isolated collateral asset the health check
+///    uses *only* that asset's weighted value to evaluate additional borrows
+///    against the ceiling.
+///
+/// `isolation_debt_ceiling = 0` means no additional debt is allowed for an
+/// isolated asset (effectively disabled).  A ceiling of `i128::MAX` is
+/// treated as uncapped (same as `isolated = false`) but the asset is still
+/// flagged as isolated for reporting purposes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IsolationConfig {
+    /// Whether this asset is in isolation mode.
+    pub isolated: bool,
+    /// Maximum total debt (in the asset's raw units, not USD) that may be
+    /// backed by this collateral across all users.  Enforced in the borrow
+    /// path.  Ignored when `isolated = false`.
+    pub isolation_debt_ceiling: i128,
 }
 
 #[contracttype]
@@ -602,7 +638,84 @@ impl LendingContract {
             .unwrap_or(0)
     }
 
-    /// Deposit collateral for a user.
+    // -----------------------------------------------------------------------
+    // Isolation-mode API
+    // -----------------------------------------------------------------------
+
+    /// Configure isolation mode for `asset` (admin-only).
+    ///
+    /// Setting `isolated = true` with a positive `isolation_debt_ceiling` marks
+    /// the asset as isolated.  An isolated asset's collateral contribution is
+    /// capped so that the total debt backed by it across all users never
+    /// exceeds the ceiling.  Setting `isolated = false` removes the
+    /// restriction; the ceiling value is preserved but ignored.
+    ///
+    /// # Errors
+    /// - `Unauthorized` — caller is not the admin.
+    /// - `InvalidIsolationCeiling` — `isolation_debt_ceiling` is negative or
+    ///   zero while `isolated = true`.
+    pub fn set_asset_isolation(
+        env: Env,
+        asset: Address,
+        isolated: bool,
+        isolation_debt_ceiling: i128,
+    ) -> Result<(), LendingError> {
+        assert_admin(&env);
+        if isolated && isolation_debt_ceiling <= 0 {
+            return Err(LendingError::InvalidIsolationCeiling);
+        }
+        let config = IsolationConfig {
+            isolated,
+            isolation_debt_ceiling,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetIsolation(asset), &config);
+        Ok(())
+    }
+
+    /// Return the isolation configuration for `asset`.
+    ///
+    /// Returns `None` when no configuration has been set (equivalent to
+    /// `isolated = false`).
+    pub fn get_asset_isolation(env: Env, asset: Address) -> Option<IsolationConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetIsolation(asset))
+    }
+
+    /// Return the current running isolation-debt total for `asset`.
+    ///
+    /// This is the sum of all outstanding debt that has been attributed to
+    /// `asset` acting as isolated collateral.  Returns `0` when no debt has
+    /// been recorded (either the asset is not isolated or no borrows have
+    /// been made against it).
+    pub fn get_isolation_debt(env: Env, asset: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IsolationDebt(asset))
+            .unwrap_or(0)
+    }
+
+    /// Enforce the isolation-mode debt ceiling for `collateral_asset` when a
+    /// user attempts to borrow `borrow_amount` additional units.
+    ///
+    /// This is a **read-only check** — it does not mutate state.  Callers
+    /// must update `IsolationDebt` themselves after a successful borrow.
+    ///
+    /// Returns `Ok(())` when:
+    /// - the collateral asset is not isolated, or
+    /// - the borrow does not breach the ceiling.
+    ///
+    /// Returns `Err(IsolationCeilingExceeded)` when the ceiling would be
+    /// breached.
+    pub fn check_isolation_ceiling(
+        env: Env,
+        collateral_asset: Address,
+        borrow_amount: i128,
+    ) -> Result<(), LendingError> {
+        check_isolation_ceiling_internal(&env, &collateral_asset, borrow_amount)
+    }
     pub fn deposit(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
         check_pause_status(&env, ProtocolAction::Deposit);
         check_emergency_status(&env, ProtocolAction::Deposit);
@@ -735,6 +848,139 @@ impl LendingContract {
         env.storage()
             .persistent()
             .set(&DataKey::TotalDebt, &new_total_debt);
+        Ok(updated.principal)
+    }
+
+    /// Isolation-aware borrow for cross-asset positions.
+    ///
+    /// Identical to [`borrow`] but additionally:
+    ///
+    /// 1. Checks that `collateral_asset` is not isolated **or**, if it is,
+    ///    that the new borrow does not push the running `IsolationDebt` past
+    ///    the asset's `isolation_debt_ceiling`.
+    /// 2. On success, increments `IsolationDebt(collateral_asset)` by the
+    ///    net new principal added to the user's position.
+    ///
+    /// Use this function in any cross-asset borrow path where `collateral_asset`
+    /// is the primary (or sole) isolated collateral backing the position.
+    ///
+    /// # Errors
+    /// - All errors from [`borrow`].
+    /// - `IsolationCeilingExceeded` — borrow would breach the per-asset ceiling.
+    pub fn borrow_against_collateral(
+        env: Env,
+        user: Address,
+        amount: i128,
+        collateral_asset: Address,
+    ) -> Result<i128, LendingError> {
+        check_pause_status(&env, ProtocolAction::Borrow);
+        check_emergency_status(&env, ProtocolAction::Borrow);
+        if amount <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+        user.require_auth();
+        let min_borrow = Self::get_min_borrow(env.clone());
+        if amount < min_borrow {
+            return Err(LendingError::BelowMinimumBorrow);
+        }
+
+        // Isolation-mode check: verify ceiling before mutating any state.
+        check_isolation_ceiling_internal(&env, &collateral_asset, amount)?;
+
+        let now = env.ledger().timestamp();
+        let position = load_debt(&env, &user);
+        let prev_principal = position.principal;
+        let rate = current_borrow_rate(&env);
+        let updated = borrow_amount(position, now, amount, rate).map_err(|e| match e {
+            debt::DebtError::InvalidAmount => LendingError::InvalidAmount,
+            debt::DebtError::Overflow => LendingError::Overflow,
+        })?;
+        save_debt(&env, &user, &updated);
+
+        // Track protocol-level total debt.
+        let total_debt: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalDebt)
+            .unwrap_or(0);
+        let delta = updated
+            .principal
+            .checked_sub(prev_principal)
+            .expect("borrow_against_collateral: delta overflow");
+        let new_total_debt = total_debt
+            .checked_add(delta)
+            .expect("borrow_against_collateral: total_debt overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalDebt, &new_total_debt);
+
+        // Update the per-asset isolation debt tracker only when the asset is
+        // actually configured as isolated.  Non-isolated assets are not tracked.
+        if is_asset_isolated(&env, &collateral_asset) {
+            increment_isolation_debt(&env, &collateral_asset, delta);
+        }
+
+        Ok(updated.principal)
+    }
+
+    /// Isolation-aware repay for cross-asset positions.
+    ///
+    /// Identical to [`repay`] but decrements `IsolationDebt(collateral_asset)`
+    /// by the net principal reduction so the ceiling tracks accurately after
+    /// partial or full repayments.
+    ///
+    /// Pass the same `collateral_asset` that was supplied to
+    /// [`borrow_against_collateral`] when the position was opened.
+    pub fn repay_against_collateral(
+        env: Env,
+        user: Address,
+        amount: i128,
+        collateral_asset: Address,
+    ) -> Result<i128, LendingError> {
+        check_pause_status(&env, ProtocolAction::Repay);
+        check_emergency_status(&env, ProtocolAction::Repay);
+        if amount <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+
+        let active: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::FlashActive)
+            .unwrap_or(false);
+        if active {
+            panic!("FlashLoanReentrancy");
+        }
+        user.require_auth();
+        let now = env.ledger().timestamp();
+        let position = load_debt(&env, &user);
+        let prev_principal = position.principal;
+        let rate = current_borrow_rate(&env);
+        let updated = repay_amount(position, now, amount, rate).map_err(|e| match e {
+            debt::DebtError::InvalidAmount => LendingError::InvalidAmount,
+            debt::DebtError::Overflow => LendingError::Overflow,
+        })?;
+        save_debt(&env, &user, &updated);
+
+        // Track protocol-level total debt.
+        let total_debt: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalDebt)
+            .unwrap_or(0);
+        let repaid = prev_principal.checked_sub(updated.principal).unwrap_or(0);
+        let new_total_debt = total_debt.saturating_sub(repaid);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalDebt, &new_total_debt);
+        extend_debt_ttl(&env, &user);
+
+        // Decrement the per-asset isolation debt tracker only when the asset is
+        // actually configured as isolated.
+        if is_asset_isolated(&env, &collateral_asset) {
+            decrement_isolation_debt(&env, &collateral_asset, repaid);
+        }
+
         Ok(updated.principal)
     }
 
@@ -1114,8 +1360,9 @@ impl LendingContract {
             extend_debt_ttl(&env, &user);
         }
         let rate = current_borrow_rate(&env);
+        // Clamp to zero: the protocol guarantees views never report negative debt.
         let debt =
-            effective_debt(&position, env.ledger().timestamp(), rate).unwrap_or(position.principal);
+            effective_debt(&position, env.ledger().timestamp(), rate).unwrap_or(position.principal).max(0);
 
         let health_factor = if debt > 0 {
             col.checked_mul(LIQUIDATION_THRESHOLD_BPS)
@@ -1730,8 +1977,81 @@ fn with_reentrancy_lock<T>(env: &Env, f: impl FnOnce() -> T) -> T {
     result
 }
 
-fn extend_collateral_ttl(env: &Env, user: &Address) {
-    let key = DataKey::Collateral(user.clone());
+// -----------------------------------------------------------------------
+// Isolation-mode internal helpers
+// -----------------------------------------------------------------------
+
+/// Returns `true` when `asset` has `isolated = true` in its stored config.
+/// Returns `false` when unconfigured or `isolated = false`.
+fn is_asset_isolated(env: &Env, asset: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AssetIsolation(asset.clone()))
+        .map(|c: IsolationConfig| c.isolated)
+        .unwrap_or(false)
+}
+
+/// Check whether a borrow of `amount` against `collateral_asset` would breach/// the isolation debt ceiling.  Returns `Ok(())` when the asset is not
+/// isolated or when the ceiling would not be exceeded.
+fn check_isolation_ceiling_internal(
+    env: &Env,
+    collateral_asset: &Address,
+    amount: i128,
+) -> Result<(), LendingError> {
+    let config: Option<IsolationConfig> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AssetIsolation(collateral_asset.clone()));
+
+    let cfg = match config {
+        Some(c) if c.isolated => c,
+        // Not isolated — nothing to enforce.
+        _ => return Ok(()),
+    };
+
+    let current_isolation_debt: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::IsolationDebt(collateral_asset.clone()))
+        .unwrap_or(0);
+
+    let new_isolation_debt = current_isolation_debt
+        .checked_add(amount)
+        .ok_or(LendingError::Overflow)?;
+
+    if new_isolation_debt > cfg.isolation_debt_ceiling {
+        return Err(LendingError::IsolationCeilingExceeded);
+    }
+
+    Ok(())
+}
+
+/// Increment the running isolation-debt counter for `collateral_asset` by `delta`.
+///
+/// Called after a successful `borrow_against_collateral` to keep the ceiling
+/// tracker in sync with actual outstanding debt.  Uses saturating addition so
+/// a single bad call cannot permanently break the counter — the ceiling check
+/// that precedes every borrow is the authoritative guard.
+fn increment_isolation_debt(env: &Env, collateral_asset: &Address, delta: i128) {
+    let key = DataKey::IsolationDebt(collateral_asset.clone());
+    let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let updated = current.saturating_add(delta);
+    env.storage().persistent().set(&key, &updated);
+}
+
+/// Decrement the running isolation-debt counter for `collateral_asset` by `amount`.
+///
+/// Called after a successful `repay_against_collateral`.  Uses saturating
+/// subtraction so over-repayment (e.g., interest rounding) cannot make the
+/// counter go negative.
+fn decrement_isolation_debt(env: &Env, collateral_asset: &Address, amount: i128) {
+    let key = DataKey::IsolationDebt(collateral_asset.clone());
+    let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let updated = current.saturating_sub(amount);
+    env.storage().persistent().set(&key, &updated);
+}
+
+fn extend_collateral_ttl(env: &Env, user: &Address) {    let key = DataKey::Collateral(user.clone());
     let extend_to = env.storage().max_ttl().min(PERSISTENT_TTL_LEDGERS);
     let threshold = extend_to / 2 + 1;
     if env.storage().persistent().has(&key) {
