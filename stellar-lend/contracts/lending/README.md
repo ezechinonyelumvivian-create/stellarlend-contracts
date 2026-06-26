@@ -96,6 +96,13 @@ The table below reflects the **shipping** surface of `src/lib.rs` as of this bra
 |---|---|---|---|
 | `set_min_borrow` | `(env, min_borrow: i128) → Result<(), LendingError>` | admin | Sets the minimum amount required to open or increase a borrow. |
 | `set_debt_ceiling` | `(env, ceiling: i128) → Result<(), LendingError>` | admin | Sets the maximum total protocol debt. |
+| `upgrade_init` | `(env, caller: Address, current_wasm_hash: BytesN<32>, required_approvals: u32) → Result<(), LendingError>` | admin | One-time upgrade governance bootstrap. |
+| `upgrade_propose` | `(env, caller: Address, new_wasm_hash: BytesN<32>, new_version: u32) → Result<u64, LendingError>` | admin | Timelocked WASM upgrade proposal (`MIN_THRESHOLD_DELAY_LEDGERS` ETA). |
+| `upgrade_approve` | `(env, caller: Address, proposal_id: u64) → Result<u32, LendingError>` | approver | Records an approval toward the snapshotted threshold. |
+| `upgrade_execute` | `(env, caller: Address, proposal_id: u64) → Result<(), LendingError>` | approver | Calls `update_current_contract_wasm` after timelock + threshold checks. |
+| `upgrade_add_approver` / `upgrade_remove_approver` | `(env, caller, approver) → Result<(), LendingError>` | admin | Manage the authorized approver set (max 32). |
+| `upgrade_set_required_approvals` | `(env, caller, required_approvals) → Result<(), LendingError>` | admin | Updates the live threshold for future proposals only. |
+| `upgrade_status` / `current_version` / `current_wasm_hash` | view | — | Query upgrade proposal state and active version/hash. |
 | `set_flash_fee` | `(env, fee_bps: i128) → Result<(), LendingError>` | admin | Sets the flash-loan fee in the inclusive range `[0, 1000]` bps. |
 | `set_emergency_state` | `(env, new_state: EmergencyState)` | admin or guardian | Transitions between `Normal`, `Shutdown`, and `Recovery`. Emits `EmergencyStateChanged` event. |
 
@@ -129,6 +136,17 @@ Normal ──► Shutdown ──► Recovery ──► Normal
 | `LendingError::InvalidOracleSignature` | 5001 | Oracle price update signature is invalid. |
 | `LendingError::StaleOracleTimestamp` | 5002 | Oracle price update is too old. |
 | `LendingError::OraclePubkeyNotSet` | 5003 | Oracle public key is missing from storage. |
+| `LendingError::UpgradeNotInitialized` | 3001 | Upgrade governance has not been initialized. |
+| `LendingError::ProposalNotFound` | 3002 | Unknown upgrade proposal id. |
+| `LendingError::ProposalNotReady` | 3003 | Timelock has not elapsed. |
+| `LendingError::ProposalExpired` | 3004 | Proposal expiry ledger has passed. |
+| `LendingError::ProposalAlreadyExecuted` | 3005 | Proposal was already executed. |
+| `LendingError::AlreadyApproved` | 3006 | Duplicate approval from the same signer. |
+| `LendingError::InsufficientUpgradeApprovals` | 3007 | Approval threshold not met. |
+| `LendingError::InvalidUpgradeVersion` | 3008 | Proposed version is not greater than the current version. |
+| `LendingError::ApproverNotFound` | 3009 | Approver is not in the configured set. |
+| `LendingError::MaxApproversReached` | 3010 | Approver set is at capacity. |
+| `LendingError::InvalidUpgradeConfig` | 3011 | Invalid upgrade configuration (e.g. zero threshold). |
 
 ---
 
@@ -147,7 +165,6 @@ The functions listed below appear in older documentation but are **not yet imple
 | `get_max_liquidatable_amount(env, user)` | Convenience helper for liquidators. |
 | `get_emergency_state(env)` | Public view for current lifecycle state (today exposed only via events). |
 | `deposit_collateral(env, user, asset, amount)` | Multi-asset collateral support. |
-| `upgrade_init / upgrade_propose / upgrade_approve / upgrade_execute` | Multisig upgrade governance. |
 | `data_store_init / data_save / data_load / data_backup / data_restore` | Persistent data-store management helpers. |
 
 ---

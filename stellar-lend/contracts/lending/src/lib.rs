@@ -5,9 +5,12 @@ pub mod debt;
 pub mod math;
 pub mod rate_model;
 pub mod rounding_strategy;
+pub mod upgrade;
 
 #[cfg(test)]
 mod admin_handover_test;
+#[cfg(test)]
+mod upgrade_governance_test;
 #[cfg(test)]
 mod admin_setters_dedupe_test;
 #[cfg(test)]
@@ -40,7 +43,7 @@ use debt::{
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
-    Env, IntoVal, Symbol, Val,
+    Env, IntoVal, Symbol, Val, Vec,
 };
 
 const PERSISTENT_TTL_LEDGERS: u32 = 1_000_000;
@@ -164,6 +167,17 @@ pub enum LendingError {
     PriceFeedNotFound = 3002,
     /// Operation would result in an unsafe health factor.
     HealthFactorTooLow = 3003,
+    UpgradeNotInitialized = 4001,
+    ProposalNotFound = 4002,
+    ProposalNotReady = 4003,
+    ProposalExpired = 4004,
+    ProposalAlreadyExecuted = 4005,
+    AlreadyApproved = 4006,
+    InsufficientUpgradeApprovals = 4007,
+    InvalidUpgradeVersion = 4008,
+    ApproverNotFound = 4009,
+    MaxApproversReached = 4010,
+    InvalidUpgradeConfig = 4011,
 }
 
 #[contracttype]
@@ -1058,6 +1072,98 @@ impl LendingContract {
     pub fn get_debt_asset_position(env: Env, user: Address, asset: Address) -> debt::DebtPosition {
         cross_asset::load_debt_asset(&env, &user, &asset)
     }
+
+    /// Initialize timelocked multisig upgrade governance (admin-only, once).
+    pub fn upgrade_init(
+        env: Env,
+        caller: Address,
+        current_wasm_hash: BytesN<32>,
+        required_approvals: u32,
+    ) -> Result<(), LendingError> {
+        upgrade::upgrade_init(&env, &caller, current_wasm_hash, required_approvals)
+    }
+
+    /// Propose a WASM upgrade with a timelocked ETA ledger (admin-only).
+    pub fn upgrade_propose(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<u64, LendingError> {
+        upgrade::upgrade_propose(&env, &caller, new_wasm_hash, new_version)
+    }
+
+    /// Record an approval for a pending upgrade proposal (approver-only).
+    pub fn upgrade_approve(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<u32, LendingError> {
+        upgrade::upgrade_approve(&env, &caller, proposal_id)
+    }
+
+    /// Execute an approved upgrade after the timelock elapses (approver-only).
+    pub fn upgrade_execute(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), LendingError> {
+        upgrade::upgrade_execute(&env, &caller, proposal_id)
+    }
+
+    pub fn upgrade_set_required_approvals(
+        env: Env,
+        caller: Address,
+        required_approvals: u32,
+    ) -> Result<(), LendingError> {
+        upgrade::upgrade_set_required_approvals(&env, &caller, required_approvals)
+    }
+
+    /// Add an upgrade approver (admin-only).
+    pub fn upgrade_add_approver(
+        env: Env,
+        caller: Address,
+        approver: Address,
+    ) -> Result<(), LendingError> {
+        upgrade::upgrade_add_approver(&env, &caller, approver)
+    }
+
+    /// Remove an upgrade approver (admin-only).
+    pub fn upgrade_remove_approver(
+        env: Env,
+        caller: Address,
+        approver: Address,
+    ) -> Result<(), LendingError> {
+        upgrade::upgrade_remove_approver(&env, &caller, approver)
+    }
+
+    pub fn current_version(env: Env) -> Result<u32, LendingError> {
+        upgrade::current_version(&env)
+    }
+
+    pub fn current_wasm_hash(env: Env) -> Result<BytesN<32>, LendingError> {
+        upgrade::current_wasm_hash(&env)
+    }
+
+    pub fn get_required_approvals(env: Env) -> Result<u32, LendingError> {
+        upgrade::get_required_approvals(&env)
+    }
+
+    pub fn get_upgrade_approvers(env: Env) -> Result<Vec<Address>, LendingError> {
+        upgrade::get_upgrade_approvers(&env)
+    }
+
+    pub fn get_proposal_approvals(env: Env, proposal_id: u64) -> Result<Vec<Address>, LendingError> {
+        upgrade::get_proposal_approvals(&env, proposal_id)
+    }
+
+    pub fn upgrade_status(env: Env, proposal_id: u64) -> Result<upgrade::UpgradeStatus, LendingError> {
+        upgrade::upgrade_status(&env, proposal_id)
+    }
+
+    pub fn get_min_upgrade_delay_ledgers(env: Env) -> u32 {
+        upgrade::get_min_upgrade_delay_ledgers(&env)
+    }
 }
 
 #[allow(dead_code)]
@@ -1161,7 +1267,7 @@ fn check_emergency_status(env: &Env, action: ProtocolAction) {
 
 /// Assert that the transaction signer is the protocol admin.
 /// Panics with the default auth error if not.
-fn assert_admin(env: &Env) {
+pub(crate) fn assert_admin(env: &Env) {
     let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
     admin.require_auth();
 }
