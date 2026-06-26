@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod cross_asset;
 pub mod debt;
 pub mod math;
 pub mod rate_model;
@@ -17,6 +18,8 @@ mod error_codes_test;
 mod granular_pause_ops_test;
 #[cfg(test)]
 mod health_factor_edge_test;
+#[cfg(test)]
+mod cross_asset_test;
 #[cfg(test)]
 mod interest_drift_regression_test;
 #[cfg(test)]
@@ -64,6 +67,18 @@ pub enum DataKey {
     Guardian,
     PauseState(PauseType),
     RateParams,
+    /// Cross-asset: per-(user, asset) collateral balance.
+    CollateralAsset(Address, Address),
+    /// Cross-asset: per-(user, asset) debt position.
+    DebtAsset(Address, Address),
+    /// Per-asset risk parameters (ltv, liquidation threshold, debt ceiling).
+    AssetParams(Address),
+    /// List of assets for which a user holds non-zero collateral cross-asset.
+    UserCollateralAssets(Address),
+    /// List of assets for which a user holds non-zero debt cross-asset.
+    UserDebtAssets(Address),
+    /// Per-asset total outstanding debt (cross-asset tracking).
+    TotalDebtAsset(Address),
 }
 
 #[contractevent]
@@ -133,6 +148,12 @@ pub enum LendingError {
     InvalidOracleSignature = 5001,
     StaleOracleTimestamp = 5002,
     OraclePubkeyNotSet = 5003,
+    /// The asset has not been configured via set_asset_params.
+    AssetNotConfigured = 3001,
+    /// Oracle price record is missing for the requested asset.
+    PriceFeedNotFound = 3002,
+    /// Operation would result in an unsafe health factor.
+    HealthFactorTooLow = 3003,
 }
 
 #[contracttype]
@@ -157,6 +178,63 @@ pub struct PositionSummary {
     pub collateral: i128,
     pub debt: i128,
     pub health_factor: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetParams {
+    pub ltv_bps: i128,
+    pub liquidation_threshold_bps: i128,
+    pub debt_ceiling: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossPositionSummary {
+    pub total_collateral_usd: i128,
+    pub total_debt_usd: i128,
+    pub health_factor: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetParamsSetEvent {
+    pub asset: Address,
+    pub ltv_bps: i128,
+    pub liquidation_threshold_bps: i128,
+    pub debt_ceiling: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossDepositEvent {
+    pub user: Address,
+    pub asset: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossBorrowEvent {
+    pub user: Address,
+    pub asset: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossRepayEvent {
+    pub user: Address,
+    pub asset: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossWithdrawEvent {
+    pub user: Address,
+    pub asset: Address,
+    pub amount: i128,
 }
 
 #[contract]
@@ -791,6 +869,171 @@ impl LendingContract {
             utilization_bps,
             ledger: env.ledger().sequence(),
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Cross-Asset Entrypoints
+    // ════════════════════════════════════════════════════════════════
+
+    /// Configure per-asset risk parameters.
+    ///
+    /// Only the protocol admin can call this.
+    /// Emits an `AssetParamsSetEvent` on success.
+    pub fn set_asset_params(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        ltv_bps: i128,
+        liquidation_threshold_bps: i128,
+        debt_ceiling: i128,
+    ) -> Result<(), LendingError> {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone()) {
+            return Err(LendingError::Unauthorized);
+        }
+        if ltv_bps < 0 || ltv_bps > 10000 {
+            return Err(LendingError::InvalidAmount);
+        }
+        if liquidation_threshold_bps < 0 || liquidation_threshold_bps > 10000 {
+            return Err(LendingError::InvalidAmount);
+        }
+        if debt_ceiling < 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+
+        let params = AssetParams {
+            ltv_bps,
+            liquidation_threshold_bps,
+            debt_ceiling,
+        };
+        cross_asset::set_asset_params_internal(&env, &asset, &params);
+
+        AssetParamsSetEvent {
+            asset,
+            ltv_bps,
+            liquidation_threshold_bps,
+            debt_ceiling,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Return the configured risk parameters for an asset, if any.
+    pub fn get_asset_params(env: Env, asset: Address) -> Option<AssetParams> {
+        cross_asset::load_asset_params(&env, &asset)
+    }
+
+    /// Deposit a specific asset as collateral for the user.
+    ///
+    /// Increases the user's cross-asset borrowing power.
+    /// Emits a `CrossDepositEvent` on success.
+    pub fn deposit_collateral_asset(
+        env: Env,
+        user: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, LendingError> {
+        let result = cross_asset::deposit_collateral_asset_internal(&env, &user, &asset, amount)?;
+        CrossDepositEvent {
+            user,
+            asset,
+            amount,
+        }
+        .publish(&env);
+        Ok(result)
+    }
+
+    /// Borrow a specific asset, checked against the aggregate health factor.
+    ///
+    /// Emits a `CrossBorrowEvent` on success.
+    pub fn borrow_asset(
+        env: Env,
+        user: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, LendingError> {
+        let result = cross_asset::borrow_asset_internal(&env, &user, &asset, amount)?;
+        CrossBorrowEvent {
+            user,
+            asset,
+            amount: result,
+        }
+        .publish(&env);
+        Ok(result)
+    }
+
+    /// Repay a specific borrowed asset.
+    ///
+    /// Emits a `CrossRepayEvent` on success.
+    pub fn repay_asset(
+        env: Env,
+        user: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, LendingError> {
+        let result = cross_asset::repay_asset_internal(&env, &user, &asset, amount)?;
+        CrossRepayEvent {
+            user,
+            asset,
+            amount,
+        }
+        .publish(&env);
+        Ok(result)
+    }
+
+    /// Withdraw a specific collateral asset, preserving a healthy position.
+    ///
+    /// Reverts if the post-withdrawal aggregate health factor would be < 1.0.
+    /// Emits a `CrossWithdrawEvent` on success.
+    pub fn withdraw_asset(
+        env: Env,
+        user: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, LendingError> {
+        let result = cross_asset::withdraw_asset_internal(&env, &user, &asset, amount)?;
+        CrossWithdrawEvent {
+            user,
+            asset,
+            amount,
+        }
+        .publish(&env);
+        Ok(result)
+    }
+
+    /// Return the aggregate USD-denominated position summary for cross-asset users.
+    ///
+    /// Returns zeroed values when the user has no cross-asset position.
+    pub fn get_cross_position_summary(
+        env: Env,
+        user: Address,
+    ) -> CrossPositionSummary {
+        let total_collateral_usd = cross_asset::get_cross_position_value(&env, &user).unwrap_or(0);
+        let total_debt_usd = cross_asset::get_cross_debt_value(&env, &user).unwrap_or(0);
+        let health_factor = cross_asset::compute_aggregate_health_factor(&env, &user).unwrap_or(0);
+        CrossPositionSummary {
+            total_collateral_usd,
+            total_debt_usd,
+            health_factor,
+        }
+    }
+
+    /// Return the aggregate cross-asset health factor for a user.
+    ///
+    /// Returns `HEALTH_FACTOR_NO_DEBT` (1_000_000) when the user has no cross-asset debt.
+    pub fn get_cross_health_factor(env: Env, user: Address) -> i128 {
+        cross_asset::compute_aggregate_health_factor(&env, &user).unwrap_or(0)
+    }
+
+    /// Return the per-asset collateral balance for a user.
+    pub fn get_collateral_asset_balance(env: Env, user: Address, asset: Address) -> i128 {
+        cross_asset::load_collateral_asset(&env, &user, &asset)
+    }
+
+    /// Return the per-asset debt principal for a user.
+    pub fn get_debt_asset_position(env: Env, user: Address, asset: Address) -> debt::DebtPosition {
+        cross_asset::load_debt_asset(&env, &user, &asset)
     }
 }
 
