@@ -18,6 +18,17 @@ fn test_error_code_stability_and_uniqueness() {
         (LendingError::InvalidOracleSignature, 5001),
         (LendingError::StaleOracleTimestamp, 5002),
         (LendingError::OraclePubkeyNotSet, 5003),
+        (LendingError::UpgradeNotInitialized, 3001),
+        (LendingError::ProposalNotFound, 3002),
+        (LendingError::ProposalNotReady, 3003),
+        (LendingError::ProposalExpired, 3004),
+        (LendingError::ProposalAlreadyExecuted, 3005),
+        (LendingError::AlreadyApproved, 3006),
+        (LendingError::InsufficientUpgradeApprovals, 3007),
+        (LendingError::InvalidUpgradeVersion, 3008),
+        (LendingError::ApproverNotFound, 3009),
+        (LendingError::MaxApproversReached, 3010),
+        (LendingError::InvalidUpgradeConfig, 3011),
     ];
 
     for i in 0..cases.len() {
