@@ -21,6 +21,8 @@ mod health_factor_edge_test;
 mod interest_drift_regression_test;
 #[cfg(test)]
 mod rounding_drift_test;
+#[cfg(test)]
+mod repay_debt_floor_test;
 
 use debt::{
     borrow_amount, effective_debt, load_debt, repay_amount, save_debt, settle_accrual,
@@ -724,8 +726,9 @@ impl LendingContract {
             extend_debt_ttl(&env, &user);
         }
         let rate = current_borrow_rate(&env);
+        // Clamp to zero: the protocol guarantees views never report negative debt.
         let debt =
-            effective_debt(&position, env.ledger().timestamp(), rate).unwrap_or(position.principal);
+            effective_debt(&position, env.ledger().timestamp(), rate).unwrap_or(position.principal).max(0);
 
         let health_factor = if debt > 0 {
             col.checked_mul(LIQUIDATION_THRESHOLD_BPS)
