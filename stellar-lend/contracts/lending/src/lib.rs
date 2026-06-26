@@ -44,6 +44,8 @@ mod oracle_staleness_test;
 #[cfg(test)]
 mod liquidate_rounding_test;
 #[cfg(test)]
+mod flash_utilization_test;
+#[cfg(test)]
 mod rounding_drift_test;
 #[cfg(test)]
 mod rate_cache_test;
@@ -81,6 +83,7 @@ const DEFAULT_ORACLE_MAX_AGE_SECS: u64 = 3600;
 const ORACLE_SIGNATURE_DOMAIN: &[u8] = b"StellarLendOracle";
 const BPS_DENOM: i128 = 10_000;
 const SCHEMA_VERSION_V1: u32 = 1;
+const DEFAULT_MAX_FLASH_BPS: i128 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +100,7 @@ pub enum DataKey {
     BorrowRateCache(u32),
     FlashActive,
     FlashFeeBps,
+    MaxFlashUtilizationBps,
     BorrowMinAmount,
     Admin,
     PendingAdmin,
@@ -200,6 +204,7 @@ pub enum LendingError {
     DebtCeilingExceeded = 2001,
     DepositCapExceeded = 2002,
     InvalidFeeBps = 2005,
+    InvalidFlashUtilizationBps = 2006,
     InsufficientCollateral = 2007,
     /// Rejects a liquidation where the liquidator and borrower are the same address.
     SelfLiquidation = 2008,
@@ -425,6 +430,31 @@ impl LendingContract {
             .instance()
             .get(&DataKey::FlashFeeBps)
             .unwrap_or(5)
+    }
+
+    fn max_flash_bps_config(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxFlashUtilizationBps)
+            .unwrap_or(DEFAULT_MAX_FLASH_BPS)
+    }
+
+    /// Set the maximum flash-loan utilization ratio in basis points (admin-only).
+    /// The requested amount must not exceed `max_flash_bps × available_liquidity / 10000`.
+    pub fn set_max_flash_bps(env: Env, max_flash_bps: i128) -> Result<(), LendingError> {
+        assert_admin(&env);
+        if max_flash_bps < 0 || max_flash_bps > BPS_DENOM {
+            return Err(LendingError::InvalidFlashUtilizationBps);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxFlashUtilizationBps, &max_flash_bps);
+        Ok(())
+    }
+
+    /// Return the configured maximum flash-loan utilization ratio in basis points.
+    pub fn get_max_flash_bps(env: Env) -> i128 {
+        Self::max_flash_bps_config(&env)
     }
 
     /// Propose a new admin (current admin only).
@@ -971,6 +1001,15 @@ impl LendingContract {
         let tre_bal: i128 = env.storage().persistent().get(&tre_key).unwrap_or(0);
         if amount > tre_bal {
             panic!("InsufficientLiquidity");
+        }
+
+        let max_flash_bps = Self::max_flash_bps_config(&env);
+        let max_flash_amount = tre_bal
+            .checked_mul(max_flash_bps)
+            .and_then(|value| value.checked_div(BPS_DENOM))
+            .expect("flash_loan: max-utilization calculation overflow");
+        if amount > max_flash_amount {
+            panic!("FlashLoanUtilizationExceeded");
         }
 
         initiator.require_auth();

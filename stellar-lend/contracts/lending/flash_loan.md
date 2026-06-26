@@ -48,6 +48,19 @@ The flash loan fee is configurable by the protocol admin in basis points (1 bp =
 - **Default**: 5 bps (0.05%)
 - **Maximum**: 1000 bps (10%)
 
+## Max Utilization Circuit Breaker
+
+Flash-loan size is also capped by an admin-configurable utilization ratio. Before the callback fires, the lending contract rejects any request whose principal would exceed:
+
+`max_flash_bps × available_liquidity / 10000`
+
+where `available_liquidity` is the current treasury balance available to the flash-loan path. The cap is enforced before any transfer or callback occurs.
+
+- **Setter**: `set_max_flash_bps(max_flash_bps: i128)`
+- **Getter**: `get_max_flash_bps() -> i128`
+- **Bounds**: `0..=10000`
+- **Example**: with `max_flash_bps = 5000` and `available_liquidity = 1_000`, the maximum flash loan is `500`.
+
 ## Security Assumptions
 
 - **Atomicity**: The entire process occurs in a single transaction. If repayment fails, the transaction reverts.
