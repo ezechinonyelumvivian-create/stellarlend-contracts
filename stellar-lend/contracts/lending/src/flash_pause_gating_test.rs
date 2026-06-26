@@ -29,6 +29,7 @@ fn setup() -> (Env, LendingContractClient<'static>, Address, Address, Address) {
     // pause/emergency checks; thus we can set balances even without full
     // token accounting.
     env.storage()
+    //
         .persistent()
         .set(
             &(crate::DataKey::Treasury(asset.clone())),
