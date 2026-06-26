@@ -37,6 +37,9 @@ To ensure determinism and avoid rounding ambiguity, the protocol strictly enforc
 
 There are no edge cases where a `10_000` Health Factor allows for liquidation. All price oracle rounding uses integer truncations designed to safely error on the side of protecting the borrower from false-positive liquidations.
 
+### Self-Liquidation Guard
+The `liquidate` entry point now rejects any call where the liquidator address matches the borrower address. This guard triggers before any collateral or debt state reads, preventing a borrower from liquidating their own position to capture the liquidation incentive and profit from the protocol's close-factor mechanics.
+
 ## Oracle Migration Risks and Mitigation
 
 Changing the protocol oracle (either the legacy address or the hardened module primary/fallback slots) is a high-risk administrative action that impacts the valuation of all open positions.

@@ -126,6 +126,7 @@ Normal ──► Shutdown ──► Recovery ──► Normal
 | `LendingError::DepositCapExceeded` | 2002 | Deposit would exceed the total deposit cap. |
 | `LendingError::InvalidFeeBps` | 2005 | Flash loan fee is outside the permitted range. |
 | `LendingError::InsufficientCollateral` | 2007 | Collateral is too low for the requested operation. |
+| `LendingError::SelfLiquidation` | 2008 | Liquidation rejected because the caller is also the borrower. |
 | `LendingError::InvalidOracleSignature` | 5001 | Oracle price update signature is invalid. |
 | `LendingError::StaleOracleTimestamp` | 5002 | Oracle price update is too old. |
 | `LendingError::OraclePubkeyNotSet` | 5003 | Oracle public key is missing from storage. |

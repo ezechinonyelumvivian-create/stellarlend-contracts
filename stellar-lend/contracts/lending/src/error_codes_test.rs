@@ -15,6 +15,7 @@ fn test_error_code_stability_and_uniqueness() {
         (LendingError::DepositCapExceeded, 2002),
         (LendingError::InvalidFeeBps, 2005),
         (LendingError::InsufficientCollateral, 2007),
+        (LendingError::SelfLiquidation, 2008),
         (LendingError::InvalidOracleSignature, 5001),
         (LendingError::StaleOracleTimestamp, 5002),
         (LendingError::OraclePubkeyNotSet, 5003),
