@@ -781,14 +781,7 @@ impl LendingContract {
             return Err(LendingError::InvalidAmount);
         }
 
-        let active: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::FlashActive)
-            .unwrap_or(false);
-        if active {
-            panic!("FlashLoanReentrancy");
-        }
+        require_no_active_flash_loan(&env);
         user.require_auth();
 
         let total_deposits: i128 = env
@@ -827,14 +820,7 @@ impl LendingContract {
             return Err(LendingError::InvalidAmount);
         }
 
-        let active: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::FlashActive)
-            .unwrap_or(false);
-        if active {
-            panic!("FlashLoanReentrancy");
-        }
+        require_no_active_flash_loan(&env);
         user.require_auth();
         let key = DataKey::Collateral(user.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -867,6 +853,7 @@ impl LendingContract {
     pub fn borrow(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
         check_pause_status(&env, ProtocolAction::Borrow);
         check_emergency_status(&env, ProtocolAction::Borrow);
+        require_no_active_flash_loan(&env);
         if amount <= 0 {
             return Err(LendingError::InvalidAmount);
         }
@@ -932,6 +919,7 @@ impl LendingContract {
     ) -> Result<i128, LendingError> {
         check_pause_status(&env, ProtocolAction::Borrow);
         check_emergency_status(&env, ProtocolAction::Borrow);
+        require_no_active_flash_loan(&env);
         if amount <= 0 {
             return Err(LendingError::InvalidAmount);
         }
@@ -1000,14 +988,7 @@ impl LendingContract {
             return Err(LendingError::InvalidAmount);
         }
 
-        let active: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::FlashActive)
-            .unwrap_or(false);
-        if active {
-            panic!("FlashLoanReentrancy");
-        }
+        require_no_active_flash_loan(&env);
         user.require_auth();
         let now = env.ledger().timestamp();
         let position = load_debt(&env, &user);
@@ -1100,14 +1081,7 @@ impl LendingContract {
         check_emergency_status(&env, ProtocolAction::Liquidate);
         require_fresh_valuation_prices(&env)?;
 
-        let active: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::FlashActive)
-            .unwrap_or(false);
-        if active {
-            panic!("FlashLoanReentrancy");
-        }
+        require_no_active_flash_loan(&env);
 
         let col_key = DataKey::Collateral(borrower.clone());
 
@@ -1248,14 +1222,7 @@ impl LendingContract {
             return Err(LendingError::InvalidAmount);
         }
 
-        let active: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::FlashActive)
-            .unwrap_or(false);
-        if active {
-            panic!("FlashLoanReentrancy");
-        }
+        require_no_active_flash_loan(&env);
         user.require_auth();
         let now = env.ledger().timestamp();
         let position = load_debt(&env, &user);
@@ -1355,6 +1322,7 @@ impl LendingContract {
     ) {
         check_pause_status(&env, ProtocolAction::FlashLoan);
         check_emergency_status(&env, ProtocolAction::FlashLoan);
+        require_no_active_flash_loan(&env);
 
         let tre_key = DataKey::Treasury(asset.clone());
         let tre_bal: i128 = env.storage().persistent().get(&tre_key).unwrap_or(0);
@@ -1919,32 +1887,25 @@ impl LendingContract {
     }
 }
 
-#[allow(dead_code)]
-fn acquire_reentrancy_lock(env: &Env) {
-    let reentrancy_lock_key = Symbol::new(env, "reent_l");
-    let locked: bool = env
+/// Panics if a flash loan is currently in progress.
+///
+/// All state-mutating user operations (`deposit`, `withdraw`, `borrow`,
+/// `borrow_against_collateral`, `repay`, `repay_against_collateral`,
+/// `liquidate`) call this at entry to prevent reentrancy via the
+/// `on_flash_loan` callback.
+///
+/// The `FlashActive` flag is set by [`flash_loan`] before the external
+/// callback and cleared after it returns.  On revert, Soroban's atomic
+/// transaction rollback restores the flag to `false`.
+fn require_no_active_flash_loan(env: &Env) {
+    let active: bool = env
         .storage()
-        .temporary()
-        .get(&reentrancy_lock_key)
+        .instance()
+        .get(&DataKey::FlashActive)
         .unwrap_or(false);
-    if locked {
-        panic!("reentrant call");
+    if active {
+        panic!("FlashLoanReentrancy");
     }
-    env.storage().temporary().set(&reentrancy_lock_key, &true);
-}
-
-#[allow(dead_code)]
-fn release_reentrancy_lock(env: &Env) {
-    let reentrancy_lock_key = Symbol::new(env, "reent_l");
-    env.storage().temporary().remove(&reentrancy_lock_key);
-}
-
-#[allow(dead_code)]
-fn with_reentrancy_lock<T>(env: &Env, f: impl FnOnce() -> T) -> T {
-    acquire_reentrancy_lock(env);
-    let result = f();
-    release_reentrancy_lock(env);
-    result
 }
 
 // -----------------------------------------------------------------------
