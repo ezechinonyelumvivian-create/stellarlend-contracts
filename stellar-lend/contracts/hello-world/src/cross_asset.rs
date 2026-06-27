@@ -390,6 +390,24 @@ pub fn update_asset_price(
     Ok(())
 }
 
+/// Return seconds since the asset price was last updated.
+///
+/// Returns `Ok(None)` when the asset exists but no price update timestamp
+/// has been recorded yet.
+pub fn get_asset_price_age(
+    env: &Env,
+    asset: Option<Address>,
+) -> Result<Option<u64>, CrossAssetError> {
+    let key = asset_key(asset);
+    let cfg = load_config(env, &key)?;
+
+    if cfg.last_price_update == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(env.ledger().timestamp().saturating_sub(cfg.last_price_update)))
+}
+
 /// Return the configuration for a given asset.
 pub fn get_asset_config_by_address(
     env: &Env,
