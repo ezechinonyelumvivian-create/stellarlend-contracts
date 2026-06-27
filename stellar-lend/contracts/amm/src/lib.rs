@@ -7,6 +7,8 @@ pub mod liquidity_math;
 mod sqrt_precision_test;
 #[cfg(test)]
 mod flash_swap_test;
+#[cfg(test)]
+mod fee_accrual_test;
 
 use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
 
@@ -41,6 +43,21 @@ const KEY_RES_B: (&str, &str) = ("pool", "b");
 const KEY_FLASH_ACTIVE: (&str, &str) = ("pool", "flash_active");
 const KEY_K_BEFORE: (&str, &str) = ("pool", "flash_k_before");
 
+// Per-side swap fee accumulators.
+//
+// `KEY_FEE_A` tracks the total protocol fees earned from swaps where
+// token A is the input (i.e. `swap_a_for_b`).  Each call increments it
+// by `amount_in * fee_bps / 10_000`.
+//
+// `KEY_FEE_B` tracks the total protocol fees earned from swaps where
+// token B is the input (i.e. `swap_b_for_a`).
+//
+// Both accumulators are monotonic non-decreasing and never exceed the
+// cumulative `amount_in` for their respective side because the fee
+// formula uses floor division with `fee_bps < 10_000`.
+const KEY_FEE_A: (&str, &str) = ("pool", "fee_a");
+const KEY_FEE_B: (&str, &str) = ("pool", "fee_b");
+
 #[contract]
 pub struct AmmContract;
 
@@ -51,10 +68,14 @@ impl AmmContract {
     /// Gated by the `FlashActive` reentrancy guard so that a flash swap
     /// initiated on a stale pool cannot be silently clobbered by a
     /// follow-up `init_pool` from the same transaction.
+    ///
+    /// Resets both fee accumulators to zero.
     pub fn init_pool(env: Env, a: i128, b: i128) {
         Self::assert_no_active_flash_swap(&env);
         env.storage().persistent().set(&KEY_RES_A, &a);
         env.storage().persistent().set(&KEY_RES_B, &b);
+        env.storage().persistent().set(&KEY_FEE_A, &0_i128);
+        env.storage().persistent().set(&KEY_FEE_B, &0_i128);
     }
 
     fn assert_no_active_flash_swap(env: &Env) {
@@ -112,6 +133,8 @@ impl AmmContract {
             panic!("empty pool");
         }
 
+        let fee = compute_fee(amount_in, fee_bps);
+
         // Uniswap v2 style: amount_in_with_fee = amount_in * (10000 - fee_bps)
         let fee_adj = 10_000_i128.checked_sub(fee_bps).expect("fee overflow");
         let amount_in_with_fee = amount_in.checked_mul(fee_adj).expect("overflow");
@@ -130,8 +153,16 @@ impl AmmContract {
         let new_rb = rb.checked_sub(amount_out).expect("underflow");
         assert_k_monotonic(ra, rb, new_ra, new_rb, true);
 
+        let accrued_fee_a: i128 = env
+            .storage()
+            .persistent()
+            .get(&KEY_FEE_A)
+            .unwrap_or(0);
+        let new_fee_a = accrued_fee_a.checked_add(fee).expect("fee_a overflow");
+
         env.storage().persistent().set(&KEY_RES_A, &new_ra);
         env.storage().persistent().set(&KEY_RES_B, &new_rb);
+        env.storage().persistent().set(&KEY_FEE_A, &new_fee_a);
         amount_out
     }
 
@@ -165,6 +196,8 @@ impl AmmContract {
             panic!("empty pool");
         }
 
+        let fee = compute_fee(amount_in, fee_bps);
+
         // Mirror of swap_a_for_b with A and B roles swapped.
         let fee_adj = 10_000_i128.checked_sub(fee_bps).expect("fee overflow");
         let amount_in_with_fee = amount_in.checked_mul(fee_adj).expect("overflow");
@@ -180,8 +213,16 @@ impl AmmContract {
         let new_ra = ra.checked_sub(amount_out).expect("underflow");
         assert_k_monotonic(ra, rb, new_ra, new_rb, true);
 
+        let accrued_fee_b: i128 = env
+            .storage()
+            .persistent()
+            .get(&KEY_FEE_B)
+            .unwrap_or(0);
+        let new_fee_b = accrued_fee_b.checked_add(fee).expect("fee_b overflow");
+
         env.storage().persistent().set(&KEY_RES_A, &new_ra);
         env.storage().persistent().set(&KEY_RES_B, &new_rb);
+        env.storage().persistent().set(&KEY_FEE_B, &new_fee_b);
         amount_out
     }
 
@@ -349,6 +390,29 @@ impl AmmContract {
             .get(&KEY_FLASH_ACTIVE)
             .unwrap_or(false)
     }
+
+    /// Read the total accrued swap fees per side.
+    ///
+    /// Returns `(fee_a, fee_b)` where:
+    /// - `fee_a` is the sum of fees charged on every `swap_a_for_b` call,
+    /// - `fee_b` is the sum of fees charged on every `swap_b_for_a` call.
+    ///
+    /// Each fee is computed as `amount_in * fee_bps / 10_000` (floor
+    /// division) at the time of the swap and accumulated into a
+    /// monotonic, persisted counter.
+    pub fn get_accrued_fees(env: Env) -> (i128, i128) {
+        let fee_a: i128 = env
+            .storage()
+            .persistent()
+            .get(&KEY_FEE_A)
+            .unwrap_or(0);
+        let fee_b: i128 = env
+            .storage()
+            .persistent()
+            .get(&KEY_FEE_B)
+            .unwrap_or(0);
+        (fee_a, fee_b)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +442,18 @@ fn assert_k_monotonic(
             );
         }
     }
+}
+
+/// Compute the swap fee from `amount_in` and `fee_bps` using the Uniswap-v2
+/// convention:
+///
+/// ```text
+/// fee = amount_in * fee_bps / 10_000
+/// ```
+///
+/// Uses checked arithmetic; panics on overflow.
+fn compute_fee(amount_in: i128, fee_bps: i128) -> i128 {
+    amount_in.checked_mul(fee_bps).expect("fee overflow") / 10_000
 }
 
 /// Inverse of the verify-k condition: returns the **minimum** `amount_in`
