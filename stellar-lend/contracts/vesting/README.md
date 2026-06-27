@@ -1,8 +1,8 @@
 # Vesting Contract (stellarlend-vesting)
 
-This crate implements a simple vesting contract with a configurable cliff and an admin `revoke` entrypoint that claws back unvested tokens to a treasury address.
+This contract implements on-ledger vesting for tokens with a configurable cliff, linear vesting duration, and administrative revocation. Unvested tokens are clawed back to a designated treasury address upon revocation.
 
-Key behavior:
+## On-Ledger Interface
 
 - `cliff_seconds` prevents any claims until `now >= start + cliff_seconds`.
 - Linear vesting after the cliff over `duration_seconds`.

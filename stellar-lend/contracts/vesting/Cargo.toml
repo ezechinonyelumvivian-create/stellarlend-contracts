@@ -3,6 +3,11 @@ name = "stellarlend-vesting"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "stellarlend_vesting"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
 [dependencies]
 
 [dev-dependencies]
