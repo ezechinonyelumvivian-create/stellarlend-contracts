@@ -124,6 +124,7 @@ pub enum DataKey {
     PendingAdmin,
     OraclePubKey,
     OraclePrice(Address),
+    MaxMoveBps,
     PriceMin(Address),
     PriceMax(Address),
     ValuationCollateralAsset,
@@ -271,8 +272,10 @@ pub enum LendingError {
     InvalidIsolationCeiling = 2010,
     InvalidOracleSignature = 5001,
     PriceOutOfBounds = 3004,
+    PriceUnavailable = 3005,
     StaleOracleTimestamp = 5002,
     OraclePubkeyNotSet = 5003,
+    MaxMoveBpsExceeded = 5004,
     /// The asset has not been configured via set_asset_params.
     AssetNotConfigured = 3001,
     /// Oracle price record is missing for the requested asset.
@@ -590,6 +593,21 @@ impl LendingContract {
             .unwrap_or(DEFAULT_MAX_FLASH_BPS)
     }
 
+    pub fn set_max_move_bps(env: Env, max_move_bps: i128) -> Result<(), LendingError> {
+        assert_admin(&env);
+        if !(0..=BPS_DENOM).contains(&max_move_bps) {
+            return Err(LendingError::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxMoveBps, &max_move_bps);
+        Ok(())
+    }
+
+    pub fn get_max_move_bps(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::MaxMoveBps)
+    }
+
     /// Set the maximum flash-loan utilization ratio in basis points (admin-only).
     /// The requested amount must not exceed `max_flash_bps × available_liquidity / 10000`.
     pub fn set_max_flash_bps(env: Env, max_flash_bps: i128) -> Result<(), LendingError> {
@@ -903,18 +921,45 @@ impl LendingContract {
         Ok(new_balance)
     }
 
-    /// Set the configured collateral asset.
+    /// Set the configured valuation collateral asset for the legacy single-asset flows.
     pub fn set_collateral_asset(env: Env, asset: Address) -> Result<(), LendingError> {
         assert_admin(&env);
         env.storage()
             .instance()
-            .set(&DataKey::CollateralAsset, &asset);
+            .set(&DataKey::ValuationCollateralAsset, &asset);
         Ok(())
     }
 
-    /// Get the configured collateral asset.
+    /// Get the configured valuation collateral asset for the legacy single-asset flows.
     pub fn get_collateral_asset(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::CollateralAsset)
+        env.storage()
+            .instance()
+            .get(&DataKey::ValuationCollateralAsset)
+    }
+
+    fn get_collateral_price_internal(env: &Env) -> Result<i128, LendingError> {
+        let Some(asset) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ValuationCollateralAsset)
+        else {
+            return Ok(1_000_000_000);
+        };
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<_, PriceRecord>(&DataKey::OraclePrice(asset))
+            .ok_or(LendingError::PriceUnavailable)?;
+
+        let now = env.ledger().timestamp();
+        if record.timestamp > now
+            || now > record.timestamp.saturating_add(DEFAULT_ORACLE_MAX_AGE_SECS)
+        {
+            return Err(LendingError::StaleOracleTimestamp);
+        }
+
+        Ok(record.price)
     }
 
     /// Borrow assets after pause and emergency gates pass.
@@ -2377,7 +2422,7 @@ fn require_fresh_price_for_key(env: &Env, asset_key: &DataKey) -> Result<(), Len
         .storage()
         .persistent()
         .get::<_, PriceRecord>(&DataKey::OraclePrice(asset))
-        .ok_or(LendingError::StaleOracleTimestamp)?;
+        .ok_or(LendingError::PriceUnavailable)?;
 
     let now = env.ledger().timestamp();
     if record.timestamp > now || now > record.timestamp.saturating_add(DEFAULT_ORACLE_MAX_AGE_SECS)
