@@ -104,6 +104,9 @@ impl Bridge {
 mod rotation_test;
 
 #[cfg(test)]
+mod epoch_monotonicity_proptest;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Keypair, Signer};
