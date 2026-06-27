@@ -36,6 +36,8 @@ mod granular_pause_ops_test;
 #[cfg(test)]
 mod health_factor_edge_test;
 #[cfg(test)]
+mod liquidation_sequence_invariant_test;
+#[cfg(test)]
 mod interest_drift_regression_test;
 #[cfg(test)]
 mod borrow_health_factor_test;
