@@ -121,13 +121,7 @@ pub fn apply_hysteresis(current: i128, target: i128, band: i128) -> i128 {
 ///
 /// # Returns
 /// The smoothed borrow rate.
-pub fn compute_smoothed_rate(
-    last_rate: i128,
-    target_rate: i128,
-    max_step: i128,
-    elapsed: u32,
-    hysteresis_bps: i128,
-) -> i128 {
+pub fn compute_smoothed_rate(...) -> i128 {
     let adjusted_target = apply_hysteresis(last_rate, target_rate, hysteresis_bps);
     if elapsed == 0 || max_step == i128::MAX {
         return adjusted_target;
@@ -141,6 +135,8 @@ pub fn compute_smoothed_rate(
             i128::MIN
         });
 
+    // The if/else block is the tail expression of the function.
+    // It must return an i128, so no semicolon here!
     if diff > 0 {
         last_rate
             .checked_add(diff.min(max_change))
@@ -149,6 +145,7 @@ pub fn compute_smoothed_rate(
         let decrease = diff.checked_abs().unwrap_or(i128::MAX).min(max_change);
         last_rate.checked_sub(decrease).unwrap_or(adjusted_target)
     }
+}
     if diff > 0 {
         last_rate
             .checked_add(diff.min(max_change))
